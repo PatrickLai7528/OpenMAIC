@@ -1802,12 +1802,31 @@ interface BedrockCredentials {
 
 type BedrockCredentialProvider = () => Promise<BedrockCredentials>;
 
+// Resolved at runtime on the server only. Must stay a free variable (not an
+// inline string literal) so webpackIgnore/turbopackIgnore can leave the Node
+// AWS credential chain out of the client graph — this file is also imported by
+// settings.ts / Settings UI on the browser.
+const AWS_CREDENTIAL_PROVIDERS_PACKAGE = '@aws-sdk/credential-providers';
+
 let bedrockCredentialProviderPromise: Promise<BedrockCredentialProvider> | undefined;
 
 function getBedrockCredentialProvider(): Promise<BedrockCredentialProvider> {
-  bedrockCredentialProviderPromise ??= import('@aws-sdk/credential-providers').then(
-    ({ fromNodeProviderChain }) => fromNodeProviderChain(),
-  );
+  bedrockCredentialProviderPromise ??= (async () => {
+    // Window guard must wrap the dynamic import directly so Turbopack can DCE
+    // the Node-only AWS SSO/INI credential providers from Client Component
+    // bundles (same pattern as lib/media/comfyui-workflows.ts).
+    if (typeof window !== 'undefined') {
+      throw new Error('Amazon Bedrock credential resolution is server-only');
+    }
+    const { fromNodeProviderChain } = (await import(
+      /* webpackIgnore: true */
+      /* turbopackIgnore: true */
+      AWS_CREDENTIAL_PROVIDERS_PACKAGE
+    )) as {
+      fromNodeProviderChain: () => BedrockCredentialProvider;
+    };
+    return fromNodeProviderChain();
+  })();
   return bedrockCredentialProviderPromise;
 }
 

@@ -31,6 +31,10 @@ const nextConfig: NextConfig = {
     // egress cannot resolve their SDK in the shipped deployment.
     '@aws-sdk/client-s3',
     '@aws-sdk/s3-request-presigner',
+    // Used by lib/ai/providers.ts Bedrock auth via a bundler-ignored dynamic
+    // import. Externalize so the Node credential chain (incl. SSO) stays out
+    // of the webpack/turbopack graph while remaining resolvable on the server.
+    '@aws-sdk/credential-providers',
   ],
   experimental: {
     proxyClientMaxBodySize: '200mb',
