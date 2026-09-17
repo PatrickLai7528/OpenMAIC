@@ -93,3 +93,5 @@ e2e/__screenshots-619/
 
 # local K8s deploy secrets
 /k8s/deploy.env
+/k8s/**/deploy.env
+/k8s/secrets*.yaml

@@ -1,0 +1,9 @@
+# Local secrets — never commit
+deploy.env
+*.env.local
+secrets*.yaml
+!01-secret.yaml
+
+# Generated / editor
+.DS_Store
+*.swp

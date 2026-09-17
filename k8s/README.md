@@ -140,3 +140,4 @@ kubectl -n ky-super-openamic port-forward svc/openmaic 3001:80
 
 - `NEXT_PUBLIC_*` 是映像建置期參數，不能只靠 K8s env 打開 Workbench。
 - 勿把 `deploy.env` 或含真實密碼的 Secret YAML 推進公開 Git。
+- 完整步驟見同目錄 **[DEPLOY.md](./DEPLOY.md)**。
