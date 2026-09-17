@@ -6,7 +6,7 @@
 |------|------|------|
 | `DATABASE_URL` | ✅ | 例：`postgres://open_maic:CHANGE_ME@YOUR_PG_HOST:5432/open_maic` |
 | `MINIMAX_API_KEY` | ✅ | MiniMax API Key |
-| `IMAGE` | ✅ | 例：`ghcr.io/you/openmaic:agent-runtime` |
+| `IMAGE` | ✅ | 例：`ghcr.io/<owner>/<repo>:agent-runtime`（由 GitHub Actions `Docker GHCR` workflow 推送） |
 | `OPENAI_API_KEY` | 可選 | 預設等於 `MINIMAX_API_KEY`（OpenAI 相容端點） |
 | `OPENAI_BASE_URL` / `OPENAI_MODELS` | 可選 | 預設 MiniMax OpenAI 相容設定 |
 | `APPLY_INGRESS` | 可選 | 預設 `1`；設 `0` 跳過 Ingress |

@@ -1,0 +1,95 @@
+# Build OpenMAIC Docker image (Agent Runtime / Workbench) and push to GHCR.
+# Image: ghcr.io/<owner>/<repo>:<tag>
+# Triggers only on push to feat/patricklai7528-dev (plus manual workflow_dispatch).
+#
+# Required repo setting: Actions → General → Workflow permissions → Read and write
+# (or this workflow's packages: write). Packages appear under the user/org Packages.
+name: Docker GHCR
+
+on:
+  push:
+    branches:
+      - feat/patricklai7528-dev
+  workflow_dispatch:
+
+concurrency:
+  group: docker-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must stay in sync with k8s/apply.sh defaults for PERSISTENCE_DEV_TOKEN
+  PERSISTENCE_TOKEN: openmaic-school-dev
+
+jobs:
+  build-and-push:
+    name: Build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR requires lowercase image names
+      - name: Image name (lowercase)
+        id: image
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Docker meta (tags / labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=agent-runtime
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # School / most K8s nodes are amd64. Add linux/arm64 if you need Apple Silicon nodes.
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NEXT_PUBLIC_PRO_WORKBENCH_ENABLED=true
+            NEXT_PUBLIC_MAIC_EDITOR_ENABLED=true
+            NEXT_PUBLIC_MAIC_EDITOR_RENDERER_ENABLED=true
+            NEXT_PUBLIC_PERSISTENCE=1
+            NEXT_PUBLIC_PERSISTENCE_TOKEN=${{ env.PERSISTENCE_TOKEN }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          {
+            echo "## GHCR image"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "Deploy example:"
+            echo ""
+            echo '```bash'
+            echo "IMAGE='${{ steps.image.outputs.name }}:sha-${SHORT_SHA}' \\"
+            echo "DATABASE_URL='...' MINIMAX_API_KEY='...' ./k8s/apply.sh"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
