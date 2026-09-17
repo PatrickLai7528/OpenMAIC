@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: openmaic
+  namespace: ky-super-openamic
+  labels:
+    app.kubernetes.io/name: openmaic
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: openmaic
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

@@ -1,0 +1,24 @@
+# Optional Ingress — adjust host / ingressClassName for the school cluster.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: openmaic
+  namespace: ky-super-openamic
+  labels:
+    app.kubernetes.io/name: openmaic
+  annotations:
+    # nginx.ingress.kubernetes.io/proxy-body-size: "200m"
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: openmaic.school.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: openmaic
+                port:
+                  number: 80

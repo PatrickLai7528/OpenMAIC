@@ -1,0 +1,20 @@
+# Non-secret runtime flags for Agent Runtime / Workbench backend
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openmaic-config
+  namespace: ky-super-openamic
+  labels:
+    app.kubernetes.io/name: openmaic
+data:
+  HOSTNAME: "0.0.0.0"
+  PORT: "3000"
+  NODE_ENV: "production"
+
+  OPENMAIC_AGENT_RUNTIME_ENABLED: "true"
+  # Per-pod concurrent agent runs; 2 replicas × 4 ≈ 8 simultaneous long runs
+  OPENMAIC_AGENT_RUNTIME_MAX_CONCURRENT: "4"
+
+  # Required when Agent Runtime is on (exact MiniMax model id includes the "M")
+  MODEL_ROUTES: '{"maic-agent-driver":{"model":"openai:MiniMax-M2.7-highspeed","api":"openai-completions"}}'
+  DEFAULT_MODEL: "openai:MiniMax-M2.7-highspeed"

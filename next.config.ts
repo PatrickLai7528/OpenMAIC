@@ -7,6 +7,12 @@ const nextConfig: NextConfig = {
       'lib/server/agent-runtime/import-pptx-worker.mjs',
       'skills/openmaic/**',
       'skills/agent-runtime/**',
+      // sharp@0.35: NFT traces the .node addon but often misses sibling libvips .so/.dylib
+      'node_modules/.pnpm/@img+sharp-libvips-linuxmusl-arm64@*/node_modules/@img/sharp-libvips-linuxmusl-arm64/**/*',
+      'node_modules/.pnpm/@img+sharp-libvips-linuxmusl-x64@*/node_modules/@img/sharp-libvips-linuxmusl-x64/**/*',
+      'node_modules/.pnpm/@img+sharp-libvips-linux-arm64@*/node_modules/@img/sharp-libvips-linux-arm64/**/*',
+      'node_modules/.pnpm/@img+sharp-libvips-linux-x64@*/node_modules/@img/sharp-libvips-linux-x64/**/*',
+      'node_modules/.pnpm/@img+sharp-libvips-darwin-arm64@*/node_modules/@img/sharp-libvips-darwin-arm64/**/*',
     ],
   },
   typescript: {
@@ -35,6 +41,8 @@ const nextConfig: NextConfig = {
     // import. Externalize so the Node credential chain (incl. SSO) stays out
     // of the webpack/turbopack graph while remaining resolvable on the server.
     '@aws-sdk/credential-providers',
+    // Keep sharp outside the Turbopack graph so native libvips resolves at runtime.
+    'sharp',
   ],
   experimental: {
     proxyClientMaxBodySize: '200mb',

@@ -1,0 +1,8 @@
+# Namespace for all OpenMAIC resources
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ky-super-openamic
+  labels:
+    app.kubernetes.io/name: openmaic
+    app.kubernetes.io/part-of: ky-super-openamic

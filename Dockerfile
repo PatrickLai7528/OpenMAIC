@@ -51,6 +51,7 @@ FROM base AS builder
 ARG ALLOWED_FRAME_ANCESTORS
 ARG NEXT_PUBLIC_PERSISTENCE
 ARG NEXT_PUBLIC_PERSISTENCE_TOKEN
+ARG NEXT_PUBLIC_PRO_WORKBENCH_ENABLED
 ARG NEXT_PUBLIC_MAIC_EDITOR_ENABLED
 ARG NEXT_PUBLIC_MAIC_EDITOR_RENDERER_ENABLED
 ARG NEXT_PUBLIC_MAIC_PLAYBACK_RENDERER_ENABLED
@@ -62,6 +63,7 @@ ARG NEXT_PUBLIC_ENABLE_PPTX_IMPORT
 ENV ALLOWED_FRAME_ANCESTORS=$ALLOWED_FRAME_ANCESTORS
 ENV NEXT_PUBLIC_PERSISTENCE=$NEXT_PUBLIC_PERSISTENCE
 ENV NEXT_PUBLIC_PERSISTENCE_TOKEN=$NEXT_PUBLIC_PERSISTENCE_TOKEN
+ENV NEXT_PUBLIC_PRO_WORKBENCH_ENABLED=$NEXT_PUBLIC_PRO_WORKBENCH_ENABLED
 ENV NEXT_PUBLIC_MAIC_EDITOR_ENABLED=$NEXT_PUBLIC_MAIC_EDITOR_ENABLED
 ENV NEXT_PUBLIC_MAIC_EDITOR_RENDERER_ENABLED=$NEXT_PUBLIC_MAIC_EDITOR_RENDERER_ENABLED
 ENV NEXT_PUBLIC_MAIC_PLAYBACK_RENDERER_ENABLED=$NEXT_PUBLIC_MAIC_PLAYBACK_RENDERER_ENABLED
@@ -78,6 +80,30 @@ COPY --from=deps /app/public/vendor ./public/vendor
 
 RUN pnpm build
 
+# sharp@0.35 loads libvips via dlopen from a sibling @img/sharp-libvips-* package.
+# Next 16.2 standalone tracing often omits that shared library; copy from the
+# physical pnpm store and materialize @img packages (cp -aL dereferences links).
+RUN set -eux; \
+  mkdir -p .next/standalone/node_modules/.pnpm .next/standalone/node_modules/@img; \
+  for d in node_modules/.pnpm/@img+sharp-*; do \
+    [ -d "$d" ] || continue; \
+    rm -rf ".next/standalone/node_modules/.pnpm/$(basename "$d")"; \
+    cp -a "$d" .next/standalone/node_modules/.pnpm/; \
+  done; \
+  for pkg in node_modules/.pnpm/@img+sharp-*/node_modules/@img/sharp-*; do \
+    [ -e "$pkg" ] || continue; \
+    dest=".next/standalone/node_modules/@img/$(basename "$pkg")"; \
+    rm -rf "$dest"; \
+    cp -aL "$pkg" "$dest"; \
+  done; \
+  for sharp_pkg in node_modules/.pnpm/sharp@*/node_modules/sharp; do \
+    [ -e "$sharp_pkg" ] || continue; \
+    rm -rf .next/standalone/node_modules/sharp; \
+    cp -aL "$sharp_pkg" .next/standalone/node_modules/sharp; \
+    break; \
+  done; \
+  ls -la .next/standalone/node_modules/@img; \
+  ls .next/standalone/node_modules/@img/sharp-libvips-*/lib | head
 # ---- Stage 4: Runner ----
 FROM node:22-alpine AS runner
 
