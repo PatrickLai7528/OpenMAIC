@@ -20,14 +20,11 @@ spec:
       labels:
         app.kubernetes.io/name: openmaic
     spec:
-      # Uncomment after creating the pull secret (see README):
-      # imagePullSecrets:
-      #   - name: registry-cred
+      imagePullSecrets:
+        - name: registry-cred
       containers:
         - name: openmaic
-          # Placeholder; overridden at apply time:
-          #   IMAGE=ghcr.io/you/openmaic:tag ./apply.sh
-          # or: kubectl -n ky-super-openamic set image deployment/openmaic openmaic=$IMAGE
+          # Placeholder; overridden at apply time by apply.sh (IMAGE=...).
           image: openmaic:agent-runtime
           imagePullPolicy: IfNotPresent
           ports:

@@ -2,27 +2,26 @@
 # Apply OpenMAIC manifests; pass secrets/image via env (or --env-file).
 #
 # Required:
-#   DATABASE_URL   e.g. postgres://USER:PASS@HOST:5432/DB
+#   DATABASE_URL      e.g. postgres://USER:PASS@HOST:5432/DB
 #   MINIMAX_API_KEY
-#   IMAGE          e.g. ghcr.io/you/openmaic:agent-runtime
+#   IMAGE             e.g. ghcr.io/you/openmaic:agent-runtime
+#   GHCR_USERNAME     GitHub username (for private GHCR pull)
+#   GHCR_TOKEN        GitHub PAT with read:packages (or write:packages)
 #
 # Optional:
-#   OPENAI_API_KEY          default = MINIMAX_API_KEY (OpenAI-compatible MiniMax)
-#   OPENAI_BASE_URL         default = https://api.minimaxi.com/v1
-#   OPENAI_MODELS           default = MiniMax-M2.7-highspeed
-#   MINIMAX_BASE_URL        default = https://api.minimaxi.com/anthropic/v1
-#   MINIMAX_MODELS          default = MiniMax-M2.7-highspeed
-#   PERSISTENCE_DEV_TOKEN   default = openmaic-school-dev
-#   ACCESS_CODE             default empty
-#   NAMESPACE               default = ky-super-openamic
-#   APPLY_INGRESS           default = 1 (set 0 to skip Ingress)
+#   GHCR_EMAIL                default empty (docker-registry secret)
+#   OPENAI_API_KEY            default = MINIMAX_API_KEY
+#   OPENAI_BASE_URL           default = https://api.minimaxi.com/v1
+#   OPENAI_MODELS             default = MiniMax-M2.7-highspeed
+#   MINIMAX_BASE_URL          default = https://api.minimaxi.com/anthropic/v1
+#   MINIMAX_MODELS            default = MiniMax-M2.7-highspeed
+#   PERSISTENCE_DEV_TOKEN     default = openmaic-school-dev
+#   ACCESS_CODE               default empty
+#   NAMESPACE                 default = ky-super-openamic
+#   APPLY_INGRESS             default = 1 (set 0 to skip Ingress)
+#   GHCR_SERVER               default = ghcr.io
 #
 # Examples:
-#   export DATABASE_URL='postgres://open_maic:CHANGE_ME@YOUR_PG_HOST:5432/open_maic'
-#   export MINIMAX_API_KEY='sk-...'
-#   export IMAGE='ghcr.io/you/openmaic:agent-runtime'
-#   ./apply.sh
-#
 #   set -a && source ./deploy.env && set +a && ./apply.sh
 
 set -euo pipefail
@@ -32,10 +31,14 @@ cd "$ROOT"
 
 NAMESPACE="${NAMESPACE:-ky-super-openamic}"
 APPLY_INGRESS="${APPLY_INGRESS:-1}"
+GHCR_SERVER="${GHCR_SERVER:-ghcr.io}"
+GHCR_EMAIL="${GHCR_EMAIL:-}"
 
 : "${DATABASE_URL:?Set DATABASE_URL (postgres://user:pass@host:5432/db)}"
 : "${MINIMAX_API_KEY:?Set MINIMAX_API_KEY}"
 : "${IMAGE:?Set IMAGE (registry/name:tag)}"
+: "${GHCR_USERNAME:?Set GHCR_USERNAME (GitHub username)}"
+: "${GHCR_TOKEN:?Set GHCR_TOKEN (PAT with read:packages)}"
 
 OPENAI_API_KEY="${OPENAI_API_KEY:-$MINIMAX_API_KEY}"
 OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.minimaxi.com/v1}"
@@ -48,6 +51,14 @@ ACCESS_CODE="${ACCESS_CODE:-}"
 
 echo "==> namespace ${NAMESPACE}"
 kubectl apply -f 00-namespace.yaml
+
+echo "==> secret registry-cred (GHCR pull)"
+kubectl -n "${NAMESPACE}" create secret docker-registry registry-cred \
+  --docker-server="${GHCR_SERVER}" \
+  --docker-username="${GHCR_USERNAME}" \
+  --docker-password="${GHCR_TOKEN}" \
+  --docker-email="${GHCR_EMAIL}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
 echo "==> secret openmaic-secrets (from env)"
 kubectl -n "${NAMESPACE}" create secret generic openmaic-secrets \

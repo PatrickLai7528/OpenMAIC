@@ -76,6 +76,10 @@ NAMESPACE=ky-super-openamic
 DATABASE_URL=postgres://USER:PASSWORD@PG_HOST:5432/DB_NAME
 MINIMAX_API_KEY=sk-你的真實key
 IMAGE=ghcr.io/<owner>/<repo>:agent-runtime
+
+# Private GHCR — apply.sh 會建立 secret/registry-cred
+GHCR_USERNAME=你的GitHub用戶名
+GHCR_TOKEN=ghp_你的PAT_需read_packages
 ```
 
 | 變數 | 必填 | 說明 |
@@ -83,32 +87,13 @@ IMAGE=ghcr.io/<owner>/<repo>:agent-runtime
 | `DATABASE_URL` | ✅ | Postgres 連線字串 |
 | `MINIMAX_API_KEY` | ✅ | MiniMax API Key（`OPENAI_API_KEY` 預設跟它相同） |
 | `IMAGE` | ✅ | GHCR 映像 tag（建議用 `sha-…` 鎖定版本） |
+| `GHCR_USERNAME` | ✅ | GitHub 用戶名 |
+| `GHCR_TOKEN` | ✅ | PAT（至少 `read:packages`） |
 | `APPLY_INGRESS` | 可選 | 預設 `1`；設 `0` 可先不建 Ingress |
 
 ---
 
-## 3.（可選）GHCR 私有映像 → imagePullSecrets
-
-```bash
-kubectl apply -f 00-namespace.yaml
-
-kubectl -n ky-super-openamic create secret docker-registry registry-cred \
-  --docker-server=ghcr.io \
-  --docker-username='<GitHub用戶名>' \
-  --docker-password='<PAT，需 read:packages>' \
-  --docker-email='<email>'
-```
-
-然後在 `03-deployment.yaml` 取消註解：
-
-```yaml
-imagePullSecrets:
-  - name: registry-cred
-```
-
----
-
-## 4. 一鍵佈署到 K8S
+## 3. 一鍵佈署到 K8S
 
 ```bash
 cd k8s
@@ -120,7 +105,7 @@ chmod +x ./apply.sh
 `apply.sh` 會：
 
 1. 建立／更新 Namespace `ky-super-openamic`
-2. 用 ENV 建立 Secret `openmaic-secrets`
+2. 建立／更新 `registry-cred`（GHCR pull）與 `openmaic-secrets`
 3. Apply ConfigMap / Deployment / Service（及 Ingress，除非 `APPLY_INGRESS=0`）
 4. `kubectl set image` 設成你的 `IMAGE`
 5. 等待 rollout
@@ -131,12 +116,14 @@ chmod +x ./apply.sh
 DATABASE_URL='postgres://USER:PASS@HOST:5432/DB' \
 MINIMAX_API_KEY='sk-...' \
 IMAGE='ghcr.io/owner/repo:sha-abc1234' \
+GHCR_USERNAME='you' \
+GHCR_TOKEN='ghp_...' \
 ./apply.sh
 ```
 
 ---
 
-## 5. 驗證
+## 4. 驗證
 
 ```bash
 kubectl -n ky-super-openamic get pods,svc,ingress
@@ -153,7 +140,7 @@ kubectl -n ky-super-openamic port-forward svc/openmaic 3001:80
 
 ---
 
-## 6. 之後更新
+## 5. 之後更新
 
 **只換映像（新 CI build）：**
 
@@ -167,7 +154,7 @@ kubectl -n ky-super-openamic rollout status deployment/openmaic
 
 ---
 
-## 7. Git：什麼可以提交／什麼不能
+## 6. Git：什麼可以提交／什麼不能
 
 | 可提交 | 不可提交（已 ignore） |
 |--------|----------------------|

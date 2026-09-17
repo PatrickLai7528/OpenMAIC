@@ -7,6 +7,9 @@
 | `DATABASE_URL` | ✅ | 例：`postgres://open_maic:CHANGE_ME@YOUR_PG_HOST:5432/open_maic` |
 | `MINIMAX_API_KEY` | ✅ | MiniMax API Key |
 | `IMAGE` | ✅ | 例：`ghcr.io/<owner>/<repo>:agent-runtime`（由 GitHub Actions `Docker GHCR` workflow 推送） |
+| `GHCR_USERNAME` | ✅ | GitHub 用戶名（拉 Private GHCR 映像） |
+| `GHCR_TOKEN` | ✅ | GitHub PAT，至少勾選 `read:packages` |
+| `GHCR_EMAIL` | 可選 | docker-registry secret 用，可空 |
 | `OPENAI_API_KEY` | 可選 | 預設等於 `MINIMAX_API_KEY`（OpenAI 相容端點） |
 | `OPENAI_BASE_URL` / `OPENAI_MODELS` | 可選 | 預設 MiniMax OpenAI 相容設定 |
 | `APPLY_INGRESS` | 可選 | 預設 `1`；設 `0` 跳過 Ingress |
@@ -32,13 +35,15 @@ chmod +x ./apply.sh
 DATABASE_URL='postgres://open_maic:CHANGE_ME@YOUR_PG_HOST:5432/open_maic' \
 MINIMAX_API_KEY='sk-...' \
 IMAGE='ghcr.io/YOUR_USER/openmaic:agent-runtime' \
+GHCR_USERNAME='YOUR_GITHUB_USERNAME' \
+GHCR_TOKEN='ghp_...' \
 ./apply.sh
 ```
 
 腳本會：
 
 1. `kubectl apply` Namespace / ConfigMap / Deployment / Service（可選 Ingress）
-2. 用 env 建立／更新 Secret `openmaic-secrets`
+2. 用 env 建立／更新 Secret `registry-cred`（GHCR pull）與 `openmaic-secrets`
 3. `kubectl set image deployment/openmaic openmaic=$IMAGE`
 
 ---
@@ -50,8 +55,17 @@ export NAMESPACE=ky-super-openamic
 export DATABASE_URL='postgres://open_maic:CHANGE_ME@YOUR_PG_HOST:5432/open_maic'
 export MINIMAX_API_KEY='sk-...'
 export IMAGE='ghcr.io/YOUR_USER/openmaic:agent-runtime'
+export GHCR_USERNAME='YOUR_GITHUB_USERNAME'
+export GHCR_TOKEN='ghp_...'
 
 kubectl apply -f 00-namespace.yaml
+
+kubectl -n "$NAMESPACE" create secret docker-registry registry-cred \
+  --docker-server=ghcr.io \
+  --docker-username="$GHCR_USERNAME" \
+  --docker-password="$GHCR_TOKEN" \
+  --docker-email="${GHCR_EMAIL:-}" \
+  --dry-run=client -o yaml | kubectl apply -f -
 
 kubectl -n "$NAMESPACE" create secret generic openmaic-secrets \
   --from-literal=DATABASE_URL="$DATABASE_URL" \
@@ -97,17 +111,8 @@ kubectl -n ky-super-openamic rollout restart deployment/openmaic
 ## 佈署前檢查
 
 1. 集群能否訪問 Postgres 主機（`DATABASE_URL` 裡的 host:port）
-2. 映像已含 Workbench build-arg（見 `Docs/docker-agent-runtime.md`）
-3. （可選）`imagePullSecrets` / Ingress host
-
-```bash
-kubectl -n ky-super-openamic create secret docker-registry registry-cred \
-  --docker-server=ghcr.io \
-  --docker-username='<user>' \
-  --docker-password='<token>' \
-  --docker-email='<email>'
-# 然後在 03-deployment.yaml 取消 imagePullSecrets 註解
-```
+2. 映像已含 Workbench build-arg；Private GHCR 時在 `deploy.env` 填好 `GHCR_USERNAME` / `GHCR_TOKEN`（`apply.sh` 會建 `registry-cred`）
+3. （可選）修改 Ingress host
 
 ---
 
