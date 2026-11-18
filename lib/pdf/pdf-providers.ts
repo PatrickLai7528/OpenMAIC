@@ -144,13 +144,18 @@ import type { ParsedPdfContent } from '@/lib/types/pdf';
 import { PDF_PROVIDERS } from './constants';
 import { createLogger } from '@/lib/logger';
 import { extractMinerUResult } from './mineru-parser';
+import { parseMinerUPdfChunks } from './mineru-chunks';
 import { parseWithMinerUCloud } from './mineru-cloud';
+import { parseWithMiniCPMOCR } from './minicpm-ocr';
 import { parseWithAliDocMindClient } from './alidocmind-client';
+import { parseWithDeepSeekOCR } from './deepseek-ocr';
+import { providerFetch, type ProviderFetchPolicy } from '@/lib/server/provider-fetch';
+import { MaterialSourceRefusedError } from '@/lib/server/material-extraction/errors';
 
 const log = createLogger('PDFProviders');
 const DEFAULT_MINERU_BACKEND = 'pipeline';
 
-function getMinerUBackend(): string {
+export function getMinerUBackend(): string {
   return process.env.PDF_MINERU_BACKEND?.trim() || DEFAULT_MINERU_BACKEND;
 }
 
@@ -183,11 +188,117 @@ export function describeSelfHostedMinerUError(status: number, rawBody: string): 
     );
   }
 
-  // Unknown failure — keep the raw detail but bound its length so the UI stays
-  // readable rather than showing an entire JSON blob or traceback.
-  const detail = rawBody.trim().slice(0, 300);
-  return `MinerU API error (${status})${detail ? `: ${detail}` : ''}`;
+  // Unknown failure: report the status only, whoever configured the service.
+  // The thrown message reaches clients (the parse route's response, stored
+  // extraction errors), so the body -- which can name a server's paths or
+  // configuration -- is only written to the server log by the caller.
+  return `MinerU API error (${status})`;
 }
+
+/** How much of a failed response's body is read. */
+const MINERU_ERROR_BODY_MAX_BYTES = 64 * 1024;
+
+/**
+ * A MinerU (or MinerU gateway) error body: an OpenAI-style
+ * `{"error":{"code","message"}}`, FastAPI's `{"detail": "..."}`, or plain
+ * text. Exported for unit testing.
+ */
+export function parseMinerUErrorBody(rawBody: string): { code?: string; message: string } {
+  const text = rawBody.trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { message: text };
+  }
+  if (!parsed || typeof parsed !== 'object') return { message: text };
+  const body = parsed as { error?: unknown; detail?: unknown; message?: unknown };
+  const string = (value: unknown) => (typeof value === 'string' ? value.trim() : undefined);
+  if (body.error && typeof body.error === 'object') {
+    const error = body.error as { code?: unknown; type?: unknown; message?: unknown };
+    const code = string(error.code) || string(error.type);
+    return { ...(code ? { code } : {}), message: string(error.message) ?? '' };
+  }
+  return { message: string(body.error) ?? string(body.detail) ?? string(body.message) ?? text };
+}
+
+/**
+ * The page count and page limit a "too many pages" refusal states, as far as
+ * its message says them ("PDF has 461 pages, which exceeds the 200-page
+ * limit"). Exported for unit testing.
+ */
+export function pageLimitOf(message: string): { pages?: number; maxPages?: number } {
+  const number = (match: RegExpMatchArray | null) => {
+    const value = match ? Number(match[1]) : NaN;
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  };
+  const pages = number(message.match(/\b(\d+)\s+pages\b/i));
+  const maxPages =
+    number(message.match(/\b(\d+)[-\s]pages?\s+limit\b/i)) ??
+    number(message.match(/\b(?:limit|maximum|max)\b\D{0,24}?(\d+)/i));
+  return { ...(pages ? { pages } : {}), ...(maxPages ? { maxPages } : {}) };
+}
+
+/** A failed response's body, read up to a bound: an error page can be large. */
+async function readBoundedErrorBody(response: Response): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) return '';
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < MINERU_ERROR_BODY_MAX_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } catch {
+    // A body that breaks off is read as far as it came.
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks).subarray(0, MINERU_ERROR_BODY_MAX_BYTES));
+}
+
+/**
+ * The error a failed `/file_parse` throws. A refusal of the document itself
+ * (a MinerU gateway's `pdf_too_many_pages`) is a {@link MaterialSourceRefusedError}
+ * with the counts it states: not retried, and no other provider is tried for
+ * the same file. Its message carries only those counts, never the body.
+ */
+export function selfHostedMinerUFailure(status: number, rawBody: string): Error {
+  const { code, message } = parseMinerUErrorBody(rawBody);
+  if (code === 'pdf_too_many_pages') {
+    const { pages, maxPages } = pageLimitOf(message);
+    const counts = [
+      pages ? `${pages} pages` : undefined,
+      maxPages ? `limit ${maxPages} pages` : undefined,
+    ].filter(Boolean);
+    return new MaterialSourceRefusedError(
+      `MinerU refused the document: too many pages (status ${status}${counts.length ? `; ${counts.join(', ')}` : ''})`,
+      {
+        reasonCode: 'too_many_pages',
+        reasonValues: { ...(pages ? { pages } : {}), ...(maxPages ? { maxPages } : {}) },
+      },
+    );
+  }
+  return new Error(describeSelfHostedMinerUError(status, rawBody));
+}
+
+// A caller-supplied self-hosted MinerU URL runs under the operator address
+// policy (the same one the routes validated it against: `allowLocalNetworks`
+// unset falls back to ALLOW_LOCAL_NETWORKS); a server-managed one is operator
+// configuration and may reach a local network without the opt-in. Either way
+// the strict transport pins the connect address to the vetted DNS answers and
+// refuses a 3xx instead of following it.
+function selfHostedMinerUPolicy(managed: boolean | undefined): ProviderFetchPolicy {
+  return { allowLocalNetworks: managed ? true : undefined, rejectRedirects: true };
+}
+
+const SELF_HOSTED_MINERU_CONNECTION_FAILED =
+  'Cannot connect to the self-hosted MinerU server, please check the Base URL';
+const SELF_HOSTED_MINERU_INVALID_RESPONSE =
+  'The self-hosted MinerU server returned an invalid response';
 
 /**
  * Parse PDF using specified provider
@@ -206,7 +317,12 @@ export async function parsePDF(
   if (provider.requiresApiKey && !config.apiKey) {
     // AliDocMind uses AK/SK instead of a single apiKey; check separately.
     const envAvailable = config.allowEnvFallback && !!process.env.ALIDOCMIND_ACCESS_KEY_ID;
-    if (config.providerId !== 'alidocmind' || (!config.accessKeyId && !envAvailable)) {
+    const aliDocMindCredentials =
+      config.providerId === 'alidocmind' && (Boolean(config.accessKeyId) || envAvailable);
+    // A provider with both a hosted API and a self-hosted deployment may run
+    // without a key when the operator points it at their own service.
+    const keylessSelfHost = provider.apiKeyOptionalWithBaseUrl === true && Boolean(config.baseUrl);
+    if (!aliDocMindCredentials && !keylessSelfHost) {
       throw new Error(`API key required for PDF provider: ${config.providerId}`);
     }
   }
@@ -230,6 +346,14 @@ export async function parsePDF(
 
     case 'alidocmind':
       result = await parseWithAliDocMind(config, pdfBuffer, options);
+      break;
+
+    case 'minicpm-ocr':
+      result = await parseWithMiniCPMOCR(config, pdfBuffer, options);
+      break;
+
+    case 'deepseek-ocr':
+      result = await parseWithDeepSeekOCR(config, pdfBuffer, options);
       break;
 
     default:
@@ -370,6 +494,7 @@ async function parseWithAliDocMind(
       llmEnhancement: true,
       enhancementMode: 'VLM',
       outputHtmlTable: true,
+      signal: config.signal,
     },
   );
 
@@ -630,6 +755,24 @@ export async function parseWithMinerUDocument(
     );
   }
 
+  if (options.mimeType.toLowerCase() === 'application/pdf') {
+    const chunked = await parseMinerUPdfChunks(
+      documentBuffer,
+      (bytes, fileName, signal) =>
+        requestMinerUDocument({ ...config, signal }, bytes, { ...options, fileName }),
+      config.signal,
+    );
+    if (chunked) return chunked;
+  }
+  return extractMinerUResult(await requestMinerUDocument(config, documentBuffer, options));
+}
+
+/** The original single-file request, shared by whole documents and temporary PDF chunks. */
+async function requestMinerUDocument(
+  config: PDFParserConfig,
+  documentBuffer: Buffer,
+  options: { fileName: string; mimeType: string },
+): Promise<Record<string, unknown>> {
   log.info(`[MinerU] Parsing document with MinerU server: ${config.baseUrl}`);
 
   // Create FormData for file upload
@@ -662,57 +805,50 @@ export async function parseWithMinerUDocument(
   }
 
   // POST /file_parse
-  const response = await fetch(`${config.baseUrl}/file_parse`, {
-    method: 'POST',
-    headers,
-    body: formData,
-  });
+  let response: Response;
+  try {
+    response = await providerFetch(
+      `${config.baseUrl}/file_parse`,
+      { method: 'POST', headers, body: formData, signal: config.signal },
+      selfHostedMinerUPolicy(config.managed),
+    );
+  } catch (error) {
+    // Refused, unresolvable, policy-blocked and redirecting targets all get
+    // the same message; the transport detail stays in the server log.
+    log.error('[MinerU] Request to the self-hosted server failed:', error);
+    throw new Error(SELF_HOSTED_MINERU_CONNECTION_FAILED, { cause: error });
+  }
 
   if (!response.ok) {
-    const errorText = await response.text().catch(() => response.statusText);
-    throw new Error(describeSelfHostedMinerUError(response.status, errorText));
+    const errorText = await readBoundedErrorBody(response);
+    log.error(`[MinerU] file_parse failed [status=${response.status}]: ${errorText.slice(0, 500)}`);
+    throw selfHostedMinerUFailure(response.status, errorText);
   }
 
-  const json = await response.json();
+  // A body that is not JSON must not surface the parser's message: Node's
+  // SyntaxError quotes a snippet of the input.
+  let json: { results?: Record<string, Record<string, unknown>> };
+  try {
+    json = await response.json();
+  } catch (error) {
+    log.error('[MinerU] file_parse returned a non-JSON body:', error);
+    throw new Error(SELF_HOSTED_MINERU_INVALID_RESPONSE, { cause: error });
+  }
 
   // Response: { results: { "<fileName>": { md_content, images, content_list, ... } } }
-  const fileResult = json.results?.[options.fileName];
+  const fileResult = json?.results?.[options.fileName];
   if (!fileResult) {
-    const keys = json.results ? Object.keys(json.results) : [];
+    const keys = json?.results ? Object.keys(json.results) : [];
     // Try first available key in case filename doesn't match exactly
-    const fallback = keys.length > 0 ? json.results[keys[0]] : null;
+    const fallback = keys.length > 0 ? json.results![keys[0]] : null;
     if (!fallback) {
-      throw new Error(`MinerU returned no results. Response keys: ${JSON.stringify(keys)}`);
+      throw new Error('MinerU returned no results');
     }
     log.warn(`[MinerU] Filename mismatch, using key "${keys[0]}" instead of "${options.fileName}"`);
-    return extractMinerUResult(fallback);
+    return fallback;
   }
 
-  return extractMinerUResult(fileResult);
-}
-
-/**
- * Get current PDF parser configuration from settings store
- * Note: This function should only be called in browser context
- */
-export async function getCurrentPDFConfig(): Promise<PDFParserConfig> {
-  if (typeof window === 'undefined') {
-    throw new Error('getCurrentPDFConfig() can only be called in browser context');
-  }
-
-  // Dynamic import to avoid circular dependency
-  const { useSettingsStore } = await import('@/lib/store/settings');
-  const { pdfProviderId, pdfProvidersConfig } = useSettingsStore.getState();
-
-  const providerConfig = pdfProvidersConfig?.[pdfProviderId];
-
-  return {
-    providerId: pdfProviderId,
-    apiKey: providerConfig?.apiKey,
-    baseUrl: providerConfig?.baseUrl,
-    accessKeyId: (providerConfig as { accessKeyId?: string })?.accessKeyId,
-    accessKeySecret: (providerConfig as { accessKeySecret?: string })?.accessKeySecret,
-  };
+  return fileResult;
 }
 
 // Re-export from constants for convenience

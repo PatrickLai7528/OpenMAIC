@@ -10,9 +10,9 @@ vi.mock('@/lib/config/feature-flags', () => ({
   isAgentRuntimeEnabled: () => mocks.runtimeEnabled,
   isAgentRuntimeConfigured: () => mocks.runtimeEnabled,
 }));
-vi.mock('@/lib/server/agent-runtime/owner', () => ({
-  resolveRequestOwnerId: () => 'owner-1',
-}));
+vi.mock('@/lib/server/identity/resolve', async () =>
+  (await import('../helpers/owner-resolution-mock')).ownerResolveModule(() => 'owner-1'),
+);
 vi.mock('@/lib/server/agent-runtime/store', () => ({
   getAgentSessionStore: async () => ({ listSessionsByOwner: mocks.listSessionsByOwner }),
 }));
@@ -26,6 +26,7 @@ beforeEach(() => {
     { id: 'session-queued', status: 'queued' },
     { id: 'session-running', status: 'running' },
     { id: 'session-done', status: 'succeeded' },
+    { id: 'pbl-role-internal', status: 'running' },
   ]);
 });
 

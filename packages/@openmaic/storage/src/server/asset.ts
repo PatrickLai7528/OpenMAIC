@@ -6,12 +6,15 @@ import {
   ASSET_DESCRIPTOR_MEDIA_TYPE,
   AssetNotFoundError,
   AssetQuotaExceededError,
+  AssetImmutableError,
+  AssetRootedError,
   DEFAULT_RENDERABLE_TYPES,
   EXCLUDED_RENDERABLE_TYPES,
   type AssetIndirectRead,
   type AssetPrincipal,
   type AssetStore,
 } from '../asset/types.js';
+import { storePolicyResponse } from '../store-errors.js';
 
 /** Derive the asset principal from the authenticated request session. */
 export type AssetHttpAuthenticate = (req: IncomingMessage) => Promise<AssetPrincipal | undefined>;
@@ -468,13 +471,52 @@ function servedLabel(
   };
 }
 
+/**
+ * The contract code an error declares, if it declares one.
+ *
+ * {@link AssetNotFoundError}, {@link AssetQuotaExceededError} and
+ * {@link AssetRootedError} each carry a literal `code` field, and this is what it is for: a store may reach this
+ * handler from another module realm -- a host that bundles the package more
+ * than once, an application whose store is constructed in a different bundle
+ * from its handler -- and `instanceof` is false across such a boundary while
+ * the class, the name and the code are all still exactly right. Classifying on
+ * the declared code as well as the class is what keeps a quota refusal from
+ * degrading into a 500 in those hosts, which is the difference between a
+ * client that stops and a client that retries a paid operation forever.
+ *
+ * Only these declared asset codes are recognised, as a fallback after the
+ * class check, so nothing else can dress itself up as a contract error by accident:
+ * a PostgreSQL error's `code` is a SQLSTATE, and no SQLSTATE spells
+ * `ASSET_NOT_FOUND`.
+ */
+function declaredStoreErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
+
 function classifyStoreError(error: unknown): never {
-  if (error instanceof AssetNotFoundError) throw missingAsset();
-  if (error instanceof AssetQuotaExceededError) {
+  const code = declaredStoreErrorCode(error);
+  if (error instanceof AssetNotFoundError || code === 'ASSET_NOT_FOUND') throw missingAsset();
+  if (error instanceof AssetQuotaExceededError || code === 'ASSET_QUOTA_EXCEEDED') {
     throw new AssetHttpError(
       507,
       'ASSET_QUOTA_EXCEEDED',
       '@openmaic/storage: asset quota exceeded for this principal',
+    );
+  }
+  if (error instanceof AssetImmutableError || code === 'ASSET_IMMUTABLE') {
+    throw new AssetHttpError(
+      409,
+      'ASSET_IMMUTABLE',
+      '@openmaic/storage: immutable asset; install a new content version instead',
+    );
+  }
+  if (error instanceof AssetRootedError || code === 'ASSET_ROOTED') {
+    throw new AssetHttpError(
+      409,
+      'ASSET_ROOTED',
+      '@openmaic/storage: asset is held by a reference root',
     );
   }
   throw error;
@@ -485,6 +527,14 @@ function mappedError(error: unknown): {
   body: ErrorBody;
   headers: Record<string, string>;
 } {
+  const policy = storePolicyResponse(error);
+  if (policy) {
+    return {
+      status: policy.status,
+      body: { error: { code: policy.code, message: policy.message } },
+      headers: policy.headers,
+    };
+  }
   if (error instanceof AssetHttpError) {
     return {
       status: error.status,

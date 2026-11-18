@@ -1,22 +1,21 @@
 /**
  * Stage Storage Manager
  *
- * Manages multiple stage data in IndexedDB
- * Each stage has its own storage key based on stageId
+ * Saves, loads, lists and deletes courses through the server-backed document
+ * store, and manages the owner's folders through the `/api/folders` routes.
  */
 
 import { Stage, Scene } from '../types/stage';
 import { ChatSession } from '../types/chat';
-import { db } from './database';
-import type { FolderRecord } from './database';
-import { nanoid } from 'nanoid';
-import { validateFolderName, FOLDER_COUNT_LIMIT, FolderNameError } from './folder-name-validation';
+import { db } from '@/lib/device-storage/database';
+import type { FolderRecord } from '@/lib/types/folder';
+import { FolderNameError } from './folder-name-validation';
 export { FolderNameError } from './folder-name-validation';
+import type { CourseThumbnail } from './course-cover';
 import {
   ChatStorageLockUnavailableError,
   saveChatSessions,
   loadChatSessions,
-  deleteChatSessions,
   type ChatStorageSnapshot,
 } from './chat-storage';
 import isEqual from 'lodash/isEqual';
@@ -25,7 +24,6 @@ import {
   accessDocument,
   clearCurrentScene,
   getDocumentStore,
-  getLegacyDocumentStore,
   loadCurrentScene,
   mutateDocument,
   saveCurrentScene,
@@ -36,12 +34,17 @@ import { clearAllForScene } from '@/lib/quiz/persistence';
 import { beginStageRuntimeDeletionSafely } from '@/lib/runtime/store';
 import { clearStageDrainWatermarks } from '@/lib/pbl/v2/runtime/drain';
 import { createLogger } from '@/lib/logger';
+import { settleKnownScenes, unseenScenes } from '@/lib/store/known-scenes';
 import {
   withRuntimeStorageExclusiveLockUntilSettled,
   withRuntimeStorageSharedLock,
 } from './chat-storage-lock';
-import { DocumentVersionError, type DocumentSummary } from '@openmaic/storage';
-import { isBrowserPersistenceEnabled } from '@/lib/persistence/bootstrap';
+import {
+  DocumentVersionError,
+  type DocumentStore,
+  type DocumentSummary,
+  type HttpDocumentWriteOptions,
+} from '@openmaic/storage';
 import { preparePBLScenesForDocumentPersistence } from '@/lib/pbl/v2/runtime/document-persistence';
 import {
   MISSING_ASSET_LEASE,
@@ -51,7 +54,12 @@ import {
   type MediaTaskState,
 } from '@/lib/media/resolve-media-ref';
 import { withAssetUrl } from '@/lib/media/use-asset-url';
-import { useSettingsStore } from '@/lib/store/settings';
+import { mayNameAPoolAsset } from '@/lib/media/media-placeholder';
+import { captureVideoFirstFrame } from '@/lib/media/video-first-frame';
+import {
+  currentModelCapabilities,
+  mediaGenerationDisabled,
+} from '@/lib/model-settings/capabilities';
 import {
   beginStageDeletionCascade,
   isStageDeleted,
@@ -60,11 +68,9 @@ import {
   settleStageDeletionCascade,
   unmarkStageDeleted,
 } from './deleted-stages';
-import {
-  buildStageAssetReclamationPlan,
-  executeStageAssetReclamation,
-  loadStageAssetInventory,
-} from '@/lib/media/reclaim-stage-assets';
+import { clearStageMediaCache } from '@/lib/media/clear-stage-media-cache';
+import { clearPendingMediaAllocations } from '@/lib/media/pending-media-allocations';
+import { applyKnownMediaAllocations } from '@/lib/media/reconcile-scene-media';
 import {
   collectDocumentMediaElements,
   resolveMediaTaskForElement,
@@ -72,8 +78,16 @@ import {
   type MediaTaskLookupEntry,
 } from '@/lib/media/media-task-resolution';
 import { slideMediaReferenceSlots } from '@/lib/media/slide-media-slots';
+import { omitUndefinedObjectMembers } from '@/lib/persistence/plain-json';
 
 const log = createLogger('StageStorage');
+
+/**
+ * Dispatched on `window` when something other than the library page changed
+ * the owner's courses or folders in the background (the one-way importer of
+ * pre-server browser data does), so an open library can list them again.
+ */
+export const LIBRARY_CHANGED_EVENT = 'openmaic:library-changed';
 
 export interface StageStoreData {
   stage: Stage;
@@ -131,13 +145,56 @@ function stampScene(stageId: string, scene: Scene, index: number, now: number): 
   };
 }
 
+/**
+ * Scenes joining a list, with the order they came with: other writers address a
+ * page by it. Only a scene whose order the list already holds moves, past the rest.
+ */
+function withoutOrderCollisions(list: readonly Scene[], joining: readonly Scene[]): Scene[] {
+  const taken = new Set(list.map((scene) => scene.order));
+  let next = Math.max(0, ...list.map((scene) => scene.order), ...joining.map((s) => s.order));
+  return joining.map((scene) => {
+    const order = taken.has(scene.order) ? ++next : scene.order;
+    taken.add(order);
+    return order === scene.order ? scene : { ...scene, order };
+  });
+}
+
+/**
+ * Write the whole document. The stored scene list is replaced by the one being
+ * saved, which would also delete a scene another writer added since this tab
+ * last synced, so those stay. A scene this tab has held and
+ * no longer lists is one it removed, and goes. The list and the read of what is
+ * stored are one round trip apart: a scene added in between is still deleted.
+ */
+async function saveWholeDocument(
+  store: Pick<DocumentStore<Scene, Stage>, 'saveDocument'>,
+  stageId: string,
+  existing: { readonly scenes?: readonly Scene[] } | null | undefined,
+  document: ReturnType<typeof documentSnapshot>,
+): Promise<void> {
+  const stored = existing?.scenes ?? [];
+  const unseen = unseenScenes(stageId, stored, document.scenes);
+  await store.saveDocument({
+    ...document,
+    scenes: [...document.scenes, ...withoutOrderCollisions(document.scenes, unseen)],
+  });
+  const kept = new Set([...document.scenes, ...unseen].map((scene) => scene.id));
+  settleKnownScenes(
+    stageId,
+    stored.filter((scene) => !kept.has(scene.id)),
+  );
+}
+
 function documentSnapshot(
   stageId: string,
   data: StageStoreData,
   existingOutline: AppDocumentOutline | undefined,
   now: number,
 ) {
-  const outline = data.outline ??
+  // The browser's outline carries the plan and its completion; what a
+  // producer recorded beside them (`producer`, `producerRef`, receipts) stays,
+  // so a course a generation run produced is still known as the run's.
+  const outline = (data.outline ? { ...existingOutline, ...data.outline } : undefined) ??
     existingOutline ?? {
       outlines: [],
       createdAt: now,
@@ -186,6 +243,25 @@ async function saveStageChats(
 export type StaleDroppedSave = 'stale-dropped';
 
 /**
+ * The one place every durable write passes through.
+ *
+ * A snapshot reaches storage from several producers — the debounced autosave,
+ * the aggregate save, the departing-course flush, an editor-history entry
+ * replayed by undo — and each captures content at its own moment. Any of those
+ * moments can predate a media write-back, in which case the snapshot still
+ * carries a generation placeholder the document has already moved past, and
+ * writing it would silently undo a successful rewrite. Rewriting here, rather
+ * than at each producer, is what keeps the next producer from rediscovering the
+ * same bug. Inert outside server-backed persistence, and a no-op allocation for
+ * a snapshot that holds no stale placeholder.
+ */
+function withKnownMediaAllocations(stageId: string, data: StageStoreData): StageStoreData {
+  const applied = applyKnownMediaAllocations(stageId, data.stage, data.scenes);
+  if (!applied) return data;
+  return { ...data, stage: applied.stage as StageStoreData['stage'], scenes: [...applied.scenes] };
+}
+
+/**
  * Save stage data to IndexedDB.
  *
  * `capturedEpoch` is the stage's deletion epoch at the moment `data` was
@@ -213,6 +289,11 @@ export async function saveStageData(
     await mutateDocument(
       stageId,
       async (existing, store) => {
+        // Reconciled here, under the document lock, not before it: a write-back
+        // running when this save was queued may only have recorded its
+        // allocation while we waited for the lock, and a departing-course flush
+        // gets no corrective pass afterwards.
+        data = withKnownMediaAllocations(stageId, data);
         // Re-check inside the mutation: a deletion that started while this
         // save was waiting must win. With Web Locks this runs under the
         // per-stage document lock; without them the callback is lock-free
@@ -231,7 +312,12 @@ export async function saveStageData(
             dropped = true;
             return;
           }
-          await store.saveDocument(documentSnapshot(stageId, data, existingOutline, now));
+          await saveWholeDocument(
+            store,
+            stageId,
+            existing,
+            documentSnapshot(stageId, data, existingOutline, now),
+          );
           if (isStageWriteStale(stageId, capturedEpoch)) {
             dropped = true;
             return;
@@ -254,6 +340,7 @@ export async function saveStageData(
       log.info(`Dropped save mid-write for deleted/stale stage: ${stageId}`);
       return 'stale-dropped';
     }
+    storedDocuments.add(stageId);
     log.info(`Saved stage: ${stageId}`);
     return failedChanges.length > 0 ? { failedChanges } : undefined;
   } catch (error) {
@@ -304,6 +391,8 @@ export async function saveStageDataIncremental(
     await mutateDocument(
       stageId,
       async (existing, store) => {
+        // Reconciled under the lock, for the reason saveStageData gives.
+        data = withKnownMediaAllocations(stageId, data);
         // Re-check inside the mutation: `existing === undefined` after a
         // deletion must not be mistaken for a legacy destination — the
         // full-save fallback below would otherwise rebuild the deleted
@@ -332,7 +421,10 @@ export async function saveStageDataIncremental(
               dropped = true;
               return;
             }
-            await store.saveDocument(
+            await saveWholeDocument(
+              store,
+              stageId,
+              existing,
               documentSnapshot(
                 stageId,
                 { ...data, scenes: persistedScenes },
@@ -418,6 +510,7 @@ export async function saveStageDataIncremental(
     log.info(`Dropping incremental chat tail for deleted/stale stage: ${stageId}`);
     return 'stale-dropped';
   }
+  if (needsDocumentWrite) storedDocuments.add(stageId);
   const failedChanges: PendingChange[] = [];
   if (has('chats') && !(await saveStageChats(stageId, data))) {
     failedChanges.push({ kind: 'chats' });
@@ -426,33 +519,214 @@ export async function saveStageDataIncremental(
 }
 
 /**
+ * Courses whose document this page has seen on the server: loaded it, or
+ * saved it. The regular save reads the document before writing to find out
+ * (a missing document takes the whole-document path); the unload write below
+ * cannot afford that read and relies on this record instead.
+ */
+const storedDocuments = new Set<string>();
+
+/**
+ * How many request-body bytes the unload write may have in flight at once.
+ * Browsers cap the combined body size of a page's in-flight keepalive
+ * requests at 64 KiB and reject a request that would exceed it; the rest is
+ * headroom for keepalive requests the page sends for other reasons.
+ */
+export const UNLOAD_KEEPALIVE_BUDGET_BYTES = 48 * 1024;
+
+let keepaliveBytesInFlight = 0;
+
+/** What the unload write did with the document changes it was given. */
+export interface UnloadWriteResult {
+  /** Changes handed to keepalive requests (or, for the reading position, written). */
+  readonly sent: readonly PendingChange[];
+  /**
+   * Document changes that could not be sent this way: a structural or outline
+   * change (those need the whole document, and hold back every other document
+   * change of the course with them), a project scene whose learner
+   * state must sync first, a course this page has not seen on the server, or
+   * a body that does not fit the keepalive budget. Leaving now loses them.
+   */
+  readonly deferred: readonly PendingChange[];
+  /**
+   * Settles once every request has: true when all of them succeeded. Only
+   * meaningful while the page stays alive (the user stayed, or the page was
+   * only hidden); after an unload nothing observes it.
+   */
+  readonly settled: Promise<boolean>;
+}
+
+type KeepaliveDocumentStore = {
+  putScene(stageId: string, scene: Scene, options?: HttpDocumentWriteOptions): Promise<void>;
+  putStage(stageId: string, stage: Stage, options?: HttpDocumentWriteOptions): Promise<void>;
+};
+
+function utf8JsonBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+/**
+ * Write pending scene and stage changes while the page is unloading.
+ *
+ * The regular save cannot run here: it reads the document before writing,
+ * and an unload aborts that read, so the write is never sent. This path
+ * writes each changed scene and the stage directly, with keepalive requests
+ * that outlive the page, using what this page already knows about the stored
+ * document instead of reading it. It starts every request synchronously (the
+ * caller is an unload event handler, which gets no later turn), keeps their
+ * combined bodies inside `UNLOAD_KEEPALIVE_BUDGET_BYTES`, and reports what it
+ * could not send so the caller can ask the user before leaving.
+ *
+ * Like the regular incremental save the writes are last-write-wins and are
+ * fenced by the deletion epoch; a refusal from the server (for example a
+ * document at an older DSL version, which only the whole-document save can
+ * upgrade) fails the request, which the caller retries only if the page
+ * stays alive.
+ */
+export function writeStageChangesForUnload(
+  stageId: string,
+  changes: readonly PendingChange[],
+  data: StageStoreData,
+  capturedEpoch: number,
+): UnloadWriteResult {
+  const sent: PendingChange[] = [];
+  const deferred: PendingChange[] = [];
+  const requests: Promise<boolean>[] = [];
+  if (isStageWriteStale(stageId, capturedEpoch)) {
+    return { sent, deferred, settled: Promise.resolve(true) };
+  }
+
+  const documentChanges: Array<{ change: PendingChange; body: Scene | Stage }> = [];
+  data = withKnownMediaAllocations(stageId, data);
+  const now = Date.now();
+  // A structural or outline change needs the whole-document save, and the
+  // course's other document changes belong to that same save: written alone,
+  // a scene could land with an order that collides with its neighbours, or a
+  // stage that no longer lists media of a scene the structure change removes
+  // while that scene survives. So one such change holds back all of them.
+  const wholeDocumentOnly = changes.some(
+    (change) => change.kind === 'structure' || change.kind === 'outline',
+  );
+  for (const change of changes) {
+    if (wholeDocumentOnly && (change.kind === 'scene' || change.kind === 'stage')) {
+      deferred.push(change);
+      continue;
+    }
+    switch (change.kind) {
+      case 'currentScene':
+        // Device-local: the write completes without the network.
+        requests.push(
+          saveCurrentScene(stageId, data.currentSceneId).then(
+            () => true,
+            () => false,
+          ),
+        );
+        sent.push(change);
+        break;
+      case 'chats':
+        // Learner runtime, not the document: left to the regular save.
+        break;
+      case 'structure':
+      case 'outline':
+        deferred.push(change);
+        break;
+      case 'stage':
+        if (!storedDocuments.has(stageId)) deferred.push(change);
+        else documentChanges.push({ change, body: stampStage(stageId, data.stage, now) });
+        break;
+      case 'scene': {
+        const index = data.scenes.findIndex((scene) => scene.id === change.sceneId);
+        const scene = data.scenes[index];
+        // A removed scene is a structure change, which is deferred on its own.
+        if (!scene) break;
+        if (!storedDocuments.has(stageId) || scene.content.type === 'pbl') {
+          deferred.push(change);
+          break;
+        }
+        documentChanges.push({ change, body: stampScene(stageId, scene, index, now) });
+        break;
+      }
+    }
+  }
+
+  if (documentChanges.length > 0) {
+    let store: KeepaliveDocumentStore | undefined;
+    try {
+      store = getDocumentStore() as unknown as KeepaliveDocumentStore;
+    } catch (error) {
+      log.warn('Document storage is unavailable for the unload write:', error);
+    }
+    for (const { change, body } of documentChanges) {
+      const bytes = utf8JsonBytes(omitUndefinedObjectMembers(body));
+      if (!store || keepaliveBytesInFlight + bytes > UNLOAD_KEEPALIVE_BUDGET_BYTES) {
+        deferred.push(change);
+        continue;
+      }
+      keepaliveBytesInFlight += bytes;
+      const request =
+        change.kind === 'stage'
+          ? store.putStage(stageId, body as Stage, { keepalive: true })
+          : store.putScene(stageId, body as Scene, { keepalive: true });
+      requests.push(
+        request
+          .then(
+            () => true,
+            (error: unknown) => {
+              log.warn(`Unload write of ${change.kind} for stage ${stageId} failed:`, error);
+              return false;
+            },
+          )
+          .finally(() => {
+            keepaliveBytesInFlight -= bytes;
+          }),
+      );
+      sent.push(change);
+    }
+  }
+
+  return {
+    sent,
+    deferred,
+    settled: Promise.all(requests).then((results) => results.every(Boolean)),
+  };
+}
+
+/** @internal Test-only reset of the unload write's module state. */
+export function resetUnloadWriteStateForTests(): void {
+  storedDocuments.clear();
+  keepaliveBytesInFlight = 0;
+}
+
+/**
  * Load stage data from IndexedDB
  */
 export async function loadStageData(stageId: string): Promise<StageStoreData | null> {
   try {
+    // Chat runtime data lives in a separate IndexedDB database. Keep the
+    // document available when that independent store is temporarily
+    // unavailable; a later chat load/save can recover without treating the
+    // already-loaded stage as missing. Read alongside the document, not after
+    // it: the chat read is several round trips of its own, and nothing about it
+    // depends on the document.
+    let chatSnapshot: ChatStorageSnapshot = { sessions: [], restoreMarker: undefined };
+    const chatsLoad = loadChatSessions(stageId, {
+      onSnapshot: (snapshot) => {
+        chatSnapshot = snapshot;
+      },
+    }).catch((error: unknown): ChatSession[] => {
+      log.warn(`Failed to load chat sessions for stage ${stageId}:`, error);
+      return [];
+    });
+
     const access = await accessDocument(stageId);
     const document = access.document;
     if (!document) {
       log.info(`Stage not found: ${stageId}`);
       return null;
     }
+    if (!access.readOnlyLegacy) storedDocuments.add(stageId);
     const currentScene = await loadCurrentScene(stageId);
-
-    // Chat runtime data lives in a separate IndexedDB database. Keep the
-    // document available when that independent store is temporarily
-    // unavailable; a later chat load/save can recover without treating the
-    // already-loaded stage as missing.
-    let chats: ChatSession[] = [];
-    let chatSnapshot: ChatStorageSnapshot = { sessions: [], restoreMarker: undefined };
-    try {
-      chats = await loadChatSessions(stageId, {
-        onSnapshot: (snapshot) => {
-          chatSnapshot = snapshot;
-        },
-      });
-    } catch (error) {
-      log.warn(`Failed to load chat sessions for stage ${stageId}:`, error);
-    }
+    const chats = await chatsLoad;
 
     log.info(`Loaded stage: ${stageId}, scenes: ${document.scenes.length}, chats: ${chats.length}`);
 
@@ -568,6 +842,11 @@ async function performStageDeletion(stageId: string): Promise<void> {
   // sitting in the debounce window must not even start a flush after the
   // delete.
   discardPendingStageChanges(stageId);
+  // Media allocations parked for slides this stage will never build now have
+  // no possible destination. Their bytes are the server's to expire: an
+  // allocation no document ever commits is released once its pending TTL runs
+  // out, so dropping the record here loses nothing but the record.
+  clearPendingMediaAllocations(stageId);
   let documentDeleted = false;
   try {
     // storageSharedLockHeld: the cascade below holds the EXCLUSIVE epoch, which
@@ -579,42 +858,22 @@ async function performStageDeletion(stageId: string): Promise<void> {
         // Lock order: per-stage document lock, then the exclusive runtime epoch.
         withRuntimeStorageExclusiveLockUntilSettled(async (releaseCaller) => {
           try {
-            const deletionDocument =
-              document ??
-              ({
-                stage: { id: stageId, name: '', createdAt: 0, updatedAt: 0 },
-                scenes: [],
-              } satisfies Pick<AppDocument, 'stage' | 'scenes'>);
-            const assetInventory = await loadStageAssetInventory(deletionDocument);
-            const assetPlan = buildStageAssetReclamationPlan(
-              stageId,
-              assetInventory.refs,
-              assetInventory.mediaRows,
-              assetInventory.audioRows,
-            );
-
             // Collect scene ids before deletion so we can sweep per-scene localStorage
             // keys (quiz draft / submitted answers / graded results).
-            const legacyScenes = await db.scenes.where('stageId').equals(stageId).toArray();
-            const sceneIds = [
-              ...new Set([
-                ...(document?.scenes.map((s) => s.id) ?? []),
-                ...legacyScenes.map((s) => s.id),
-              ]),
-            ];
+            const sceneIds = [...new Set(document?.scenes.map((s) => s.id) ?? [])];
 
             await store.deleteDocument(stageId);
             documentDeleted = true;
 
-            // Reclamation is intentionally after the authoritative document
-            // delete. The prepared plan has already captured Dexie-only orphans.
-            await executeStageAssetReclamation(assetPlan, null);
+            // Local cache only, and intentionally after the authoritative
+            // delete: liveness for the globally keyed audio rows is proved
+            // against the documents that survive, which requires this one to
+            // already be gone. The registry entries the document named are
+            // released by the server's own pass once the grace elapses.
+            await clearStageMediaCache(stageId);
 
-            // Clear legacy chat rows and the device-scoped playback cursor. Runtime
-            // rows of every kind are removed by the all-kind cascade below.
-            await deleteChatSessions(stageId);
-            // An unmigrated legacy playback row must not outlive its stage.
-            await db.playbackState.delete(stageId);
+            // Clear the device-scoped playback cursor. Runtime rows of every
+            // kind are removed by the all-kind cascade below.
             try {
               await clearCursor(stageId);
             } catch (error) {
@@ -631,32 +890,9 @@ async function performStageDeletion(stageId: string): Promise<void> {
               clearAllForScene(sceneId);
             }
 
-            // Migration retains legacy rows, but an explicit whole-stage deletion does not.
-            // Folder membership is device-local organization metadata; drop it too.
-            await db.transaction(
-              'rw',
-              [db.stages, db.scenes, db.stageOutlines, db.stageFolders],
-              async () => {
-                await db.stages.delete(stageId);
-                await db.scenes.where('stageId').equals(stageId).delete();
-                await db.stageOutlines.delete(stageId);
-                await db.stageFolders.delete(stageId);
-              },
-            );
-
-            // Mirror hygiene: the legacy roster mirror is read-only migration
-            // input, but a deleted stage needs no migration source — drop its
-            // rows. Best-effort: a failure here must not abort the deletion.
-            try {
-              await db.generatedAgents.where('stageId').equals(stageId).delete();
-            } catch (error) {
-              log.warn(`Failed to clear legacy agent mirror rows for stage ${stageId}:`, error);
-            }
-
-            // Learner-runtime data lives in a separate IndexedDB database, so it is
-            // cascaded after the Dexie work: it cannot join those transactions, and a
-            // runtime failure must not abort them (the helper warns instead of
-            // throwing).
+            // Learner-runtime data is a separate store, so it is cascaded after
+            // the document: a runtime failure must not undo the deletion (the
+            // helper warns instead of throwing).
             const runtimeDeletion = beginStageRuntimeDeletionSafely(stageId);
             await runtimeDeletion.completion;
             try {
@@ -722,91 +958,39 @@ async function performStageDeletion(stageId: string): Promise<void> {
 }
 
 /**
- * PG mode: the owner-scoped course listing.
+ * List the owner's courses, newest first.
  *
  * The generic `GET /api/persistence/documents` listing is deliberately refused
  * server-side (`403 FORBIDDEN_DOCUMENTS`): the capability model serves reads by
- * id and listings owner-only, so the home's course list must not ask for an
- * unscoped listing at all. `GET /api/stages` IS the owner listing — it resolves
- * the anonymous owner from the same cookie the workbench uses and returns that
- * owner's stage documents. Folders list through the owner-scoped
- * `GET /api/folders` (see `listOwnerFoldersFromServer`), while membership stays
- * device-local (Dexie), so the same membership overlay the local path applies
- * keeps courses filed in this browser grouped.
- */
-async function listOwnerStagesFromServer(): Promise<StageListItem[]> {
-  const res = await fetch('/api/stages', { credentials: 'include' });
-  if (!res.ok) {
-    throw new Error(`Failed to list owner stages: HTTP ${res.status}`);
-  }
-  const body = (await res.json().catch(() => null)) as { stages?: unknown } | null;
-  if (!body || !Array.isArray(body.stages)) {
-    throw new Error('Malformed /api/stages response: expected { stages: [...] }');
-  }
-  const memberships = await db.stageFolders.toArray();
-  const folderByStage = new Map(memberships.map((m) => [m.stageId, m.folderId]));
-  return (body.stages as DocumentSummary[])
-    .map((item) => {
-      const base: StageListItem = {
-        id: item.id,
-        name: item.name,
-        sceneCount: item.sceneCount,
-        createdAt: item.createdAt,
-        updatedAt: item.updatedAt,
-        ...(item.description !== undefined ? { description: item.description } : {}),
-        ...(item.interactiveMode !== undefined ? { interactiveMode: item.interactiveMode } : {}),
-        ...(item.taskEngineMode !== undefined ? { taskEngineMode: item.taskEngineMode } : {}),
-      };
-      const folderId = folderByStage.get(item.id) ?? item.folderId;
-      return folderId ? { ...base, folderId } : base;
-    })
-    .sort((a, b) => b.updatedAt - a.updatedAt);
-}
-
-/**
- * List all stages
+ * id and listings owner-only, so the course list must not ask for an unscoped
+ * listing at all. `GET /api/stages` IS the owner listing — it resolves the
+ * owner from the same cookie the workbench uses and returns that owner's stage
+ * documents, each with the folder it is filed in.
  */
 export async function listStages(): Promise<StageListItem[]> {
   try {
-    if (isBrowserPersistenceEnabled()) {
-      // Server persistence is on: the generic document listing answers 403 by
-      // design, so the home/workspace library lists through the owner-scoped
-      // workbench surface instead.
-      return await listOwnerStagesFromServer();
+    const res = await fetch('/api/stages', { credentials: 'include' });
+    if (!res.ok) {
+      throw new Error(`Failed to list owner stages: HTTP ${res.status}`);
     }
-    const summaries = await getDocumentStore().listDocuments();
-    const ids = new Set(summaries.map((summary) => summary.id));
-    const legacy = await getLegacyDocumentStore().listStages();
-    const legacyOnly = await Promise.all(
-      legacy
-        .filter((stage) => !ids.has(stage.id))
-        .map(async (stage) => {
-          const snapshot = await getLegacyDocumentStore().read(stage.id);
-          return snapshot ? { ...stage, sceneCount: snapshot.scenes.length } : null;
-        }),
-    );
-    // Folder membership is device-local metadata kept in this Dexie database,
-    // not in the DocumentStore; join it in so callers can group courses.
-    const memberships = await db.stageFolders.toArray();
-    const folderByStage = new Map(memberships.map((m) => [m.stageId, m.folderId]));
-    return [
-      ...summaries,
-      ...legacyOnly
-        .filter((stage) => stage !== null)
-        .map((stage) => ({
-          id: stage.id,
-          name: stage.name,
-          description: stage.description,
-          sceneCount: stage.sceneCount,
-          createdAt: stage.createdAt,
-          updatedAt: stage.updatedAt,
-          interactiveMode: stage.interactiveMode,
-          taskEngineMode: stage.taskEngineMode,
-        })),
-    ]
-      .map((item) =>
-        folderByStage.get(item.id) ? { ...item, folderId: folderByStage.get(item.id) } : item,
-      )
+    const body = (await res.json().catch(() => null)) as { stages?: unknown } | null;
+    if (!body || !Array.isArray(body.stages)) {
+      throw new Error('Malformed /api/stages response: expected { stages: [...] }');
+    }
+    return (body.stages as DocumentSummary[])
+      .map((item) => {
+        const base: StageListItem = {
+          id: item.id,
+          name: item.name,
+          sceneCount: item.sceneCount,
+          createdAt: item.createdAt,
+          updatedAt: item.updatedAt,
+          ...(item.description !== undefined ? { description: item.description } : {}),
+          ...(item.interactiveMode !== undefined ? { interactiveMode: item.interactiveMode } : {}),
+          ...(item.taskEngineMode !== undefined ? { taskEngineMode: item.taskEngineMode } : {}),
+        };
+        return item.folderId ? { ...base, folderId: item.folderId } : base;
+      })
       .sort((a, b) => b.updatedAt - a.updatedAt);
   } catch (error) {
     log.error('Failed to list stages:', error);
@@ -849,33 +1033,70 @@ export async function resolveThumbnailMediaValue(
   storedBlob: Blob | undefined,
   mimeType: string,
   mediaGenerationDisabled = false,
+  signal?: AbortSignal,
+  onPoolReadError?: () => void,
 ): Promise<string | undefined> {
+  return (
+    await resolveThumbnailMedia(
+      ref,
+      task,
+      storedBlob,
+      mimeType,
+      mediaGenerationDisabled,
+      signal,
+      onPoolReadError,
+    )
+  ).value;
+}
+
+/** {@link resolveThumbnailMediaValue}, also returning the bytes behind an object URL it minted. */
+async function resolveThumbnailMedia(
+  ref: string,
+  task: MediaTaskState | undefined,
+  storedBlob: Blob | undefined,
+  mimeType: string,
+  mediaGenerationDisabled = false,
+  signal?: AbortSignal,
+  onPoolReadError?: () => void,
+): Promise<{ value: string | undefined; blob?: Blob }> {
   if (isConcreteMediaAddress(ref)) {
-    return renderableMediaUrl(resolveMediaRef(ref, undefined, MISSING_ASSET_LEASE));
+    return { value: renderableMediaUrl(resolveMediaRef(ref, undefined, MISSING_ASSET_LEASE)) };
   }
   let blob: Blob | undefined;
   try {
-    blob = await withAssetUrl(ref, async (url) => {
-      if (!url) return undefined;
-      const response = await fetch(url);
-      const fetched = response.ok ? await response.blob() : undefined;
-      // Zero-byte pool answers are not usable bytes: fall back to the stored
-      // row (or no thumbnail) rather than minting an empty image.
-      return fetched && fetched.size > 0 ? fetched : undefined;
-    });
+    // A generation placeholder is not a pool id: leasing it is a guaranteed
+    // miss, and a thumbnail grid asks once per slide per load.
+    blob = mayNameAPoolAsset(ref)
+      ? await withAssetUrl(ref, async (url) => {
+          if (!url) return undefined;
+          const response = await fetch(url, { signal });
+          const fetched = response.ok ? await response.blob() : undefined;
+          // Zero-byte pool answers are not usable bytes: fall back to the
+          // stored row (or no thumbnail) rather than minting an empty image.
+          return fetched && fetched.size > 0 ? fetched : undefined;
+        })
+      : undefined;
   } catch {
-    // Pool access is optional for the home-page compatibility thumbnail.
+    // Pool access is optional for the home-page compatibility thumbnail, but
+    // the caller learns the media may be incomplete only for now.
+    onPoolReadError?.();
   }
   blob ??= storedBlob && storedBlob.size > 0 ? blobWithType(storedBlob, mimeType) : undefined;
   if (blob) {
-    const url = URL.createObjectURL(blobWithType(blob, mimeType));
-    return renderableMediaUrl(
-      resolveMediaRef(ref, task, { status: 'resolved', url }, mediaGenerationDisabled),
-    );
+    const typed = blobWithType(blob, mimeType);
+    const url = URL.createObjectURL(typed);
+    return {
+      value: renderableMediaUrl(
+        resolveMediaRef(ref, task, { status: 'resolved', url }, mediaGenerationDisabled),
+      ),
+      blob: typed,
+    };
   }
-  return renderableMediaUrl(
-    resolveMediaRef(ref, task, MISSING_ASSET_LEASE, mediaGenerationDisabled),
-  );
+  return {
+    value: renderableMediaUrl(
+      resolveMediaRef(ref, task, MISSING_ASSET_LEASE, mediaGenerationDisabled),
+    ),
+  };
 }
 
 function revokeObjectUrl(url: string | undefined) {
@@ -884,183 +1105,245 @@ function revokeObjectUrl(url: string | undefined) {
   }
 }
 
-export function revokeThumbnailSlideMediaUrls(slides: Record<string, ThumbnailSlide>) {
-  for (const slide of Object.values(slides)) {
-    for (const slot of slideMediaReferenceSlots(slide)) {
-      if (slot.kind !== 'video-media-ref') revokeObjectUrl(slot.read());
-    }
+/** Release the object URLs a {@link getFirstSlideForStage} thumbnail minted. */
+export function revokeThumbnailSlideMediaUrls(slide: ThumbnailSlide) {
+  for (const slot of slideMediaReferenceSlots(slide)) {
+    if (slot.kind !== 'video-media-ref') revokeObjectUrl(slot.read());
   }
 }
 
 /**
- * Get first slide scene's canvas data for each stage (for thumbnail preview).
- * Also resolves generated image/video refs from mediaFiles so thumbnails show real media.
- * Returns a map of stageId -> Slide (canvas data with resolved media)
+ * Get one stage's first slide canvas (for its home-page thumbnail), or null
+ * when the course has no slide scene. Also resolves generated image/video refs
+ * from mediaFiles so the thumbnail shows real media; the caller owns the
+ * returned object URLs ({@link revokeThumbnailSlideMediaUrls}).
+ *
+ * `signal` cancels the media byte fetches. An aborted load still settles
+ * (with whatever it resolved); the caller discards and revokes it.
  */
-export async function getFirstSlideByStages(
-  stageIds: string[],
-): Promise<Record<string, ThumbnailSlide>> {
-  const result: Record<string, ThumbnailSlide> = {};
-  try {
-    await Promise.all(
-      stageIds.map(async (stageId) => {
-        const document = (await accessDocument(stageId)).document;
-        const firstSlide = document?.scenes.find((s) => s.content?.type === 'slide');
-        if (firstSlide && firstSlide.content.type === 'slide') {
-          const slide = structuredClone(firstSlide.content.canvas);
+export async function getFirstSlideForStage(
+  stageId: string,
+  signal?: AbortSignal,
+): Promise<ThumbnailSlide | null> {
+  return (await loadFirstSlideThumbnail(stageId, signal)).slide;
+}
 
-          const mediaSlots = [...slideMediaReferenceSlots(slide)];
-          const mediaElements = new Set<ThumbnailMediaElement>();
-          for (const slot of mediaSlots) {
-            if (
-              slot.element &&
-              (slot.element.type === 'video' ||
-                !!getThumbnailMediaRef(slot.element as ThumbnailMediaElement))
-            ) {
-              mediaElements.add(slot.element as ThumbnailMediaElement);
-            }
-          }
-          const backgroundSlot = mediaSlots.find((slot) => slot.kind === 'background-image');
-          const backgroundRef = backgroundSlot?.read();
-          if (
-            mediaElements.size > 0 ||
-            (backgroundRef && isResolvableThumbnailMediaRef(backgroundRef))
-          ) {
-            const settings = useSettingsStore.getState();
-            const mediaRecords = await db.mediaFiles.where('stageId').equals(stageId).toArray();
-            const mediaMap = new Map(
-              mediaRecords.map((record) => [getMediaRecordElementId(record.id), record] as const),
-            );
-            type ThumbnailTaskEntry = MediaTaskLookupEntry & {
-              readonly record: (typeof mediaRecords)[number];
-            };
-            const taskEntries = Object.fromEntries(
-              mediaRecords.map((record) => [
-                getMediaRecordElementId(record.id),
-                {
-                  stageId: record.stageId,
-                  type: record.type,
-                  status: record.error ? 'failed' : 'done',
-                  placeholderRef: record.placeholderRef,
-                  poster: record.poster ? `${record.id}:poster` : undefined,
-                  record,
-                } satisfies ThumbnailTaskEntry,
-              ]),
-            );
-            const documentElements = collectDocumentMediaElements(
-              document?.stage,
-              document?.scenes ?? [],
-            );
+/**
+ * {@link getFirstSlideForStage}, also telling whether the thumbnail is
+ * complete: `false` when reading a media asset failed (a transient error, not
+ * a missing asset), so the thumbnail shows less than the course holds and must
+ * not be kept beyond this page.
+ */
+export async function loadFirstSlideThumbnail(
+  stageId: string,
+  signal?: AbortSignal,
+): Promise<{ slide: ThumbnailSlide | null; complete: boolean }> {
+  const document = (await accessDocument(stageId)).document;
+  signal?.throwIfAborted();
+  return slideCoverFromDocument(stageId, document, signal);
+}
 
-            if (backgroundSlot && backgroundRef && isResolvableThumbnailMediaRef(backgroundRef)) {
-              const selectedRecord = mediaMap.get(backgroundRef);
-              const task = selectedRecord?.error
-                ? ({
-                    status: 'failed',
-                    errorCode: selectedRecord.errorCode,
-                    retryCount: 0,
-                  } satisfies MediaTaskState)
-                : undefined;
-              const record = selectedRecord && !selectedRecord.error ? selectedRecord : undefined;
-              backgroundSlot.write(
-                (await resolveThumbnailMediaValue(
-                  backgroundRef,
-                  task,
-                  record?.type === 'image' ? record.blob : undefined,
-                  record?.mimeType || 'image/png',
-                  !settings.imageGenerationEnabled,
-                )) ?? '',
-              );
-            }
+/**
+ * {@link loadFirstSlideThumbnail}'s slide pipeline over an already-loaded
+ * document, so {@link loadCourseCover} reads a course only once.
+ */
+async function slideCoverFromDocument(
+  stageId: string,
+  document: AppDocument | null,
+  signal?: AbortSignal,
+): Promise<{ slide: ThumbnailSlide | null; complete: boolean }> {
+  const firstSlide = document?.scenes.find((s) => s.content?.type === 'slide');
+  if (!firstSlide || firstSlide.content.type !== 'slide') return { slide: null, complete: true };
+  const slide = structuredClone(firstSlide.content.canvas);
+  let complete = true;
+  const onPoolReadError = () => {
+    complete = false;
+  };
 
-            for (const el of mediaElements) {
-              const videoBinding =
-                el.type === 'video'
-                  ? resolveVideoMediaForElement(
-                      taskEntries,
-                      el as import('@openmaic/dsl').PPTVideoElement,
-                      stageId,
-                      documentElements,
-                    )
-                  : undefined;
-              const mediaRef = videoBinding?.sourceRef ?? getThumbnailMediaRef(el);
-              if (!mediaRef) continue;
-              const selected =
-                el.type === 'video'
-                  ? videoBinding?.task
-                  : resolveMediaTaskForElement(
-                      taskEntries,
-                      el as import('@openmaic/dsl').PPTElement,
-                      stageId,
-                    );
-              const selectedRecord = selected?.record;
-              const task = selectedRecord?.error
-                ? ({
-                    status: 'failed',
-                    errorCode: selectedRecord.errorCode,
-                    retryCount: 0,
-                  } satisfies MediaTaskState)
-                : undefined;
-              const record = selectedRecord && !selectedRecord.error ? selectedRecord : undefined;
-
-              if (el.type === 'image') {
-                el.src =
-                  (await resolveThumbnailMediaValue(
-                    mediaRef,
-                    task,
-                    record?.type === 'image' ? record.blob : undefined,
-                    record?.mimeType || 'image/png',
-                    !settings.imageGenerationEnabled,
-                  )) ?? '';
-              } else if (el.type === 'video') {
-                el.src =
-                  (await resolveThumbnailMediaValue(
-                    mediaRef,
-                    task,
-                    record?.type === 'video' ? record.blob : undefined,
-                    record?.mimeType || 'video/mp4',
-                    !settings.videoGenerationEnabled,
-                  )) ?? '';
-                const posterRef = videoBinding?.posterRef;
-                const posterRecord =
-                  posterRef && isResolvableThumbnailMediaRef(posterRef)
-                    ? mediaMap.get(posterRef)
-                    : undefined;
-                const posterBlob =
-                  posterRecord && !posterRecord.error && posterRecord.type === 'image'
-                    ? blobWithType(posterRecord.blob, posterRecord.mimeType)
-                    : record?.poster
-                      ? blobWithType(record.poster, 'image/jpeg')
-                      : undefined;
-                if (posterRef) {
-                  const posterTask = posterRecord?.error
-                    ? ({
-                        status: 'failed',
-                        errorCode: posterRecord.errorCode,
-                        retryCount: 0,
-                      } satisfies MediaTaskState)
-                    : undefined;
-                  el.poster = await resolveThumbnailMediaValue(
-                    posterRef,
-                    posterTask,
-                    posterBlob,
-                    posterRecord?.mimeType || 'image/jpeg',
-                  );
-                } else if (posterBlob) {
-                  el.poster = URL.createObjectURL(posterBlob);
-                }
-              }
-            }
-          }
-
-          result[stageId] = slide;
-        }
-      }),
-    );
-  } catch (error) {
-    log.error('Failed to load thumbnails:', error);
+  const mediaSlots = [...slideMediaReferenceSlots(slide)];
+  const mediaElements = new Set<ThumbnailMediaElement>();
+  for (const slot of mediaSlots) {
+    if (
+      slot.element &&
+      (slot.element.type === 'video' ||
+        !!getThumbnailMediaRef(slot.element as ThumbnailMediaElement))
+    ) {
+      mediaElements.add(slot.element as ThumbnailMediaElement);
+    }
   }
-  return result;
+  const backgroundSlot = mediaSlots.find((slot) => slot.kind === 'background-image');
+  const backgroundRef = backgroundSlot?.read();
+  if (mediaElements.size > 0 || (backgroundRef && isResolvableThumbnailMediaRef(backgroundRef))) {
+    const capabilities = currentModelCapabilities();
+    const imageDisabled = mediaGenerationDisabled(capabilities, 'image');
+    const videoDisabled = mediaGenerationDisabled(capabilities, 'video');
+    const mediaRecords = await db.mediaFiles.where('stageId').equals(stageId).toArray();
+    const mediaMap = new Map(
+      mediaRecords.map((record) => [getMediaRecordElementId(record.id), record] as const),
+    );
+    type ThumbnailTaskEntry = MediaTaskLookupEntry & {
+      readonly record: (typeof mediaRecords)[number];
+    };
+    const taskEntries = Object.fromEntries(
+      mediaRecords.map((record) => [
+        getMediaRecordElementId(record.id),
+        {
+          stageId: record.stageId,
+          type: record.type,
+          status: record.error ? 'failed' : 'done',
+          placeholderRef: record.placeholderRef,
+          poster: record.poster ? `${record.id}:poster` : undefined,
+          record,
+        } satisfies ThumbnailTaskEntry,
+      ]),
+    );
+    const documentElements = collectDocumentMediaElements(document?.stage, document?.scenes ?? []);
+
+    if (backgroundSlot && backgroundRef && isResolvableThumbnailMediaRef(backgroundRef)) {
+      const selectedRecord = mediaMap.get(backgroundRef);
+      const task = selectedRecord?.error
+        ? ({
+            status: 'failed',
+            errorCode: selectedRecord.errorCode,
+            retryCount: 0,
+          } satisfies MediaTaskState)
+        : undefined;
+      const record = selectedRecord && !selectedRecord.error ? selectedRecord : undefined;
+      backgroundSlot.write(
+        (await resolveThumbnailMediaValue(
+          backgroundRef,
+          task,
+          record?.type === 'image' ? record.blob : undefined,
+          record?.mimeType || 'image/png',
+          imageDisabled,
+          signal,
+          onPoolReadError,
+        )) ?? '',
+      );
+    }
+
+    for (const el of mediaElements) {
+      const videoBinding =
+        el.type === 'video'
+          ? resolveVideoMediaForElement(
+              taskEntries,
+              el as import('@openmaic/dsl').PPTVideoElement,
+              stageId,
+              documentElements,
+            )
+          : undefined;
+      const mediaRef = videoBinding?.sourceRef ?? getThumbnailMediaRef(el);
+      if (!mediaRef) continue;
+      const selected =
+        el.type === 'video'
+          ? videoBinding?.task
+          : resolveMediaTaskForElement(
+              taskEntries,
+              el as import('@openmaic/dsl').PPTElement,
+              stageId,
+            );
+      const selectedRecord = selected?.record;
+      const task = selectedRecord?.error
+        ? ({
+            status: 'failed',
+            errorCode: selectedRecord.errorCode,
+            retryCount: 0,
+          } satisfies MediaTaskState)
+        : undefined;
+      const record = selectedRecord && !selectedRecord.error ? selectedRecord : undefined;
+
+      if (el.type === 'image') {
+        el.src =
+          (await resolveThumbnailMediaValue(
+            mediaRef,
+            task,
+            record?.type === 'image' ? record.blob : undefined,
+            record?.mimeType || 'image/png',
+            imageDisabled,
+            signal,
+            onPoolReadError,
+          )) ?? '';
+      } else if (el.type === 'video') {
+        const video = await resolveThumbnailMedia(
+          mediaRef,
+          task,
+          record?.type === 'video' ? record.blob : undefined,
+          record?.mimeType || 'video/mp4',
+          videoDisabled,
+          signal,
+          onPoolReadError,
+        );
+        el.src = video.value ?? '';
+        const posterRef = videoBinding?.posterRef;
+        const posterRecord =
+          posterRef && isResolvableThumbnailMediaRef(posterRef)
+            ? mediaMap.get(posterRef)
+            : undefined;
+        const posterBlob =
+          posterRecord && !posterRecord.error && posterRecord.type === 'image'
+            ? blobWithType(posterRecord.blob, posterRecord.mimeType)
+            : record?.poster
+              ? blobWithType(record.poster, 'image/jpeg')
+              : undefined;
+        if (posterRef) {
+          const posterTask = posterRecord?.error
+            ? ({
+                status: 'failed',
+                errorCode: posterRecord.errorCode,
+                retryCount: 0,
+              } satisfies MediaTaskState)
+            : undefined;
+          el.poster = await resolveThumbnailMediaValue(
+            posterRef,
+            posterTask,
+            posterBlob,
+            posterRecord?.mimeType || 'image/jpeg',
+            undefined,
+            signal,
+            onPoolReadError,
+          );
+        } else if (posterBlob) {
+          el.poster = URL.createObjectURL(posterBlob);
+        }
+        // A thumbnail shows a video by its poster (SlideThumbnail): a <video>
+        // that loads its bytes leaves aborted requests behind on every page
+        // load. Generated videos usually come without one, so the opening
+        // frame stands in, and is cached with the rest of the thumbnail.
+        if (!el.poster && el.src && video.blob) {
+          const frame = await captureVideoFirstFrame(video.blob, signal);
+          if (frame) el.poster = URL.createObjectURL(frame);
+        }
+      }
+    }
+  }
+
+  return { slide, complete };
+}
+
+/**
+ * A course's cover: its first slide ({@link loadFirstSlideThumbnail}), or —
+ * only when the course has no slide at all — its first interactive scene,
+ * which the surfaces render live in a sandboxed thumbnail iframe. A course
+ * with neither has no cover (`null`).
+ *
+ * Interactive covers read only the already-loaded document, so they are
+ * always complete.
+ */
+export async function loadCourseCover(
+  stageId: string,
+  signal?: AbortSignal,
+): Promise<{ cover: CourseThumbnail | null; complete: boolean }> {
+  const document = (await accessDocument(stageId)).document;
+  signal?.throwIfAborted();
+  const slideCover = await slideCoverFromDocument(stageId, document, signal);
+  if (slideCover.slide) {
+    return { cover: { kind: 'slide', slide: slideCover.slide }, complete: slideCover.complete };
+  }
+  const interactive = document?.scenes.find((scene) => scene.content?.type === 'interactive');
+  return {
+    cover: interactive ? { kind: 'interactive', scene: interactive } : null,
+    complete: true,
+  };
 }
 
 /**
@@ -1084,9 +1367,7 @@ export async function renameStage(stageId: string, newName: string): Promise<voi
  */
 export async function stageExists(stageId: string): Promise<boolean> {
   try {
-    const summaries = await getDocumentStore().listDocuments();
-    if (summaries.some((stage) => stage.id === stageId)) return true;
-    return (await getLegacyDocumentStore().read(stageId)) !== null;
+    return (await getDocumentStore().loadDocument(stageId)) !== null;
   } catch (error) {
     log.error('Failed to check stage existence:', error);
     return false;
@@ -1095,15 +1376,11 @@ export async function stageExists(stageId: string): Promise<boolean> {
 
 // ==================== Course Folders ====================
 //
-// Folders are course-grouping metadata. Without server persistence they are
-// device-local, living in this Dexie database (`folders` + `stageFolders`
-// tables) and never touching the course document aggregate owned by the
-// `@openmaic/storage` DocumentStore. With server persistence on (`listStages`
-// reads `/api/stages`, the workspace rail's folder family writes
-// `/api/folders`), the folder list and every folder mutation go through the
-// same owner-scoped server store, so a folder created there is visible to the
-// very list that rendered the create action. A course with no `stageFolders`
-// row (or one with `folderId === undefined`) is unfiled.
+// Folders are course-grouping metadata owned by the same owner as the courses.
+// The list and every folder mutation go through the owner-scoped
+// `/api/folders` routes — the same store the workspace rail and the agent's
+// `create_folder` tool write to — and membership through
+// `/api/folders/members`. A course with no membership is unfiled.
 
 /** The wire shape of the owner-scoped folder routes (`/api/folders`). */
 type FolderRouteBody = {
@@ -1115,8 +1392,7 @@ type FolderRouteBody = {
 
 /**
  * Map a route refusal (`{ error: { code, message } }`) onto the shared
- * `FolderNameError`, exactly like the local storage boundary throws — one
- * error type for every dialog, whichever store refused the name.
+ * `FolderNameError`, so every dialog maps one error type.
  */
 function folderRouteError(body: FolderRouteBody | null | undefined): Error {
   const code = body?.error?.code;
@@ -1148,13 +1424,9 @@ function toFolderRecord(folder: FolderRecord): FolderRecord {
 }
 
 /**
- * PG mode: the owner-scoped folder listing — the same store the workspace
- * rail's `/api/folders` family and the agent's `create_folder` tool write to.
- * With server persistence on, a Dexie snapshot can never contain a
- * server-created folder, so the list the sidebar renders must read the server
- * or a created folder would not appear without a reload.
+ * List the owner's folders, ordered by their `order` field (ascending).
  */
-async function listOwnerFoldersFromServer(): Promise<FolderRecord[]> {
+export async function listFolders(): Promise<FolderRecord[]> {
   const res = await fetch('/api/folders', { credentials: 'include' });
   if (!res.ok) {
     throw new Error(`Failed to list owner folders: HTTP ${res.status}`);
@@ -1167,39 +1439,11 @@ async function listOwnerFoldersFromServer(): Promise<FolderRecord[]> {
 }
 
 /**
- * List all folders, ordered by their `order` field (ascending).
+ * Create a folder. The route validates the name (width + uniqueness) and the
+ * count limit inside its owner-scoped transaction; its refusals map onto
+ * `FolderNameError`.
  */
-export async function listFolders(): Promise<FolderRecord[]> {
-  if (isBrowserPersistenceEnabled()) {
-    return await listOwnerFoldersFromServer();
-  }
-  const folders = await db.folders.toArray();
-  return folders.sort((a, b) => a.order - b.order);
-}
-
-/** Validate a folder name against the width rule and (optionally) duplicates. */
-function assertFolderName(name: string, existing: FolderRecord[], currentId?: string): void {
-  const result = validateFolderName(name);
-  if (!result.ok) {
-    throw new FolderNameError(
-      result.kind === 'empty' ? 'Folder name must not be empty' : 'Folder name is too long',
-      result.kind,
-    );
-  }
-  const trimmed = name.trim();
-  const clash = existing.some(
-    (f) => f.name.toLowerCase() === trimmed.toLowerCase() && f.id !== currentId,
-  );
-  if (clash) throw new FolderNameError('A folder with this name already exists', 'duplicate');
-}
-
-/**
- * PG mode: create a folder through the owner-scoped route. The route re-checks
- * duplicates and the count limit inside its owner-scoped transaction; its
- * refusals map onto the same `FolderNameError` the local path throws, so the
- * classic home and the workbench dialogs map one error type.
- */
-async function createOwnerFolderFromServer(name: string): Promise<FolderRecord> {
+export async function createFolder(name: string): Promise<FolderRecord> {
   const res = await fetch('/api/folders', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -1210,44 +1454,12 @@ async function createOwnerFolderFromServer(name: string): Promise<FolderRecord> 
   if (!body?.folder) {
     throw new Error('Malformed /api/folders response: expected { folder: { ... } }');
   }
+  log.info(`Created folder "${name}" (${body.folder.id})`);
   return toFolderRecord(body.folder);
 }
 
-/**
- * Create a folder. `order` is placed after the current maximum so new folders
- * land at the end of the list. Validates the name (width + uniqueness) at the
- * storage boundary, with the read-check-write inside a read-write transaction
- * so two tabs cannot both pass the duplicate check before either write commits.
- * With server persistence on, the create goes through `POST /api/folders` —
- * the same store the workspace rail and this module's `listFolders` read.
- */
-export async function createFolder(name: string): Promise<FolderRecord> {
-  if (isBrowserPersistenceEnabled()) {
-    return await createOwnerFolderFromServer(name);
-  }
-  const now = Date.now();
-  return db.transaction('rw', db.folders, async () => {
-    const existing = await db.folders.toArray();
-    if (existing.length >= FOLDER_COUNT_LIMIT) {
-      throw new FolderNameError('Folder count limit reached', 'limit');
-    }
-    assertFolderName(name, existing);
-    const order = existing.reduce((max, folder) => Math.max(max, folder.order), -1) + 1;
-    const folder: FolderRecord = {
-      id: nanoid(),
-      name: name.trim(),
-      order,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await db.folders.put(folder);
-    log.info(`Created folder "${name}" (${folder.id})`);
-    return folder;
-  });
-}
-
-/** PG mode: rename a folder through the owner-scoped route. */
-async function renameOwnerFolderFromServer(id: string, name: string): Promise<void> {
+/** Rename a folder (`PATCH /api/folders/:id`); refusals map onto `FolderNameError`. */
+export async function renameFolder(id: string, name: string): Promise<void> {
   const res = await fetch(`/api/folders/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     headers: { 'content-type': 'application/json' },
@@ -1256,39 +1468,21 @@ async function renameOwnerFolderFromServer(id: string, name: string): Promise<vo
   if (!res.ok) {
     throw folderRouteError((await res.json().catch(() => null)) as FolderRouteBody | null);
   }
-}
-
-/**
- * Rename a folder. Validates the name (width + uniqueness excluding itself) at
- * the storage boundary, with the read-check-write inside a read-write
- * transaction so the UI invariant cannot be bypassed or raced across tabs.
- * With server persistence on, the rename goes through `PATCH /api/folders/:id`.
- */
-export async function renameFolder(id: string, name: string): Promise<void> {
-  if (isBrowserPersistenceEnabled()) {
-    await renameOwnerFolderFromServer(id, name);
-    return;
-  }
-  const now = Date.now();
-  await db.transaction('rw', db.folders, async () => {
-    const existing = await db.folders.toArray();
-    assertFolderName(name, existing, id);
-    const folder = existing.find((f) => f.id === id);
-    if (!folder) throw new Error(`Folder not found: ${id}`);
-    await db.folders.put({ ...folder, name: name.trim(), updatedAt: now });
-    log.info(`Renamed folder ${id} to "${name}"`);
-  });
+  log.info(`Renamed folder ${id} to "${name}"`);
 }
 
 export type DeleteFolderMode = 'ungroup' | 'remove';
 
 /**
- * PG mode: delete a folder through the owner-scoped route. `mode=remove`
- * returns the captured member course ids, which this module then runs through
- * the same `deleteStageData` cascade the local path uses, so both modes leave
- * the server store and the device-side mirrors in the same state.
+ * Delete a folder (`DELETE /api/folders/:id`).
+ *
+ * - `'ungroup'` (default): drop the folder; its courses become unfiled.
+ * - `'remove'`: drop the folder AND delete every course that was filed in it.
+ *   The route returns the captured member ids, and each runs through
+ *   {@link deleteStageData} so the full deletion cascade (document, runtime,
+ *   device-local caches) applies.
  */
-async function deleteOwnerFolderFromServer(id: string, mode: DeleteFolderMode): Promise<void> {
+export async function deleteFolder(id: string, mode: DeleteFolderMode = 'ungroup'): Promise<void> {
   const res = await fetch(`/api/folders/${encodeURIComponent(id)}?mode=${mode}`, {
     method: 'DELETE',
   });
@@ -1298,79 +1492,26 @@ async function deleteOwnerFolderFromServer(id: string, mode: DeleteFolderMode): 
     const removedStageIds = body?.removedStageIds ?? [];
     await Promise.all(removedStageIds.map((stageId) => deleteStageData(stageId)));
   }
-}
-
-/**
- * Delete a folder.
- *
- * - `'ungroup'` (default): drop the folder; its courses become unfiled (their
- *   `stageFolders` rows are deleted, so `listStages` reports them without a
- *   `folderId`).
- * - `'remove'`: drop the folder AND delete every course that was filed in it,
- *   running each through {@link deleteStageData} so the full deletion cascade
- *   (document, scenes, chats, runtime, mirrors) applies.
- *
- * With server persistence on, the delete goes through `DELETE /api/folders/:id`
- * and the `remove` cascade deletes the returned member ids.
- */
-export async function deleteFolder(id: string, mode: DeleteFolderMode = 'ungroup'): Promise<void> {
-  if (isBrowserPersistenceEnabled()) {
-    await deleteOwnerFolderFromServer(id, mode);
-    return;
-  }
-  // Atomically capture members, delete the folder row, and clear all membership
-  // rows in ONE transaction BEFORE the course-deletion cascade. This makes the
-  // folder invisible to `setStageFolder` (which checks folder existence in its
-  // own transaction) for the entire duration of the cascade, preventing an
-  // orphan membership from being written while courses are being deleted.
-  const members = await db.transaction('rw', [db.folders, db.stageFolders], async () => {
-    const rows = await db.stageFolders.where('folderId').equals(id).toArray();
-    await db.folders.delete(id);
-    for (const row of rows) {
-      await db.stageFolders.delete(row.stageId);
-    }
-    return rows;
-  });
-
-  if (mode === 'remove') {
-    // Now delete each member course through the full cascade. The folder is
-    // already gone, so a concurrent setStageFolder will reject the assignment.
-    for (const member of members) {
-      if (member.stageId) await deleteStageData(member.stageId);
-    }
-  }
   log.info(`Deleted folder ${id} (mode=${mode})`);
 }
 
 /**
  * Move a course into a folder, or out of all folders when `folderId` is
- * `undefined`. Idempotent.
- *
- * Membership is device-local either way (the `stageFolders` overlay keeps
- * courses filed in this browser even when the folders themselves live on the
- * server), so only the destination's existence check differs between modes:
- * locally the `folders` table is checked inside the same transaction, while
- * with server persistence on the folder list came from `/api/folders` and the
- * local table has no row for it — the id is trusted from the rendered tree,
- * and the server re-checks existence on its own membership writes.
+ * `undefined` (`POST /api/folders/members`). Idempotent. The route checks that
+ * the folder exists and belongs to the owner; a missing folder is refused.
  */
 export async function setStageFolder(stageId: string, folderId: string | undefined): Promise<void> {
-  const now = Date.now();
-  // Validate the destination folder exists before writing the membership row.
-  // Without this, an import that started inside a folder which is then deleted
-  // would write an orphan membership pointing at a gone folder. The check+write
-  // is in one transaction so deletion cannot race between them. Unfiling
-  // (folderId undefined) always succeeds — it just removes the membership.
-  if (folderId !== undefined) {
-    await db.transaction('rw', [db.folders, db.stageFolders], async () => {
-      if (!isBrowserPersistenceEnabled()) {
-        const folder = await db.folders.get(folderId);
-        if (!folder) throw new Error(`Folder not found: ${folderId}`);
-      }
-      await db.stageFolders.put({ stageId, folderId, updatedAt: now });
-    });
-  } else {
-    await db.stageFolders.put({ stageId, folderId: undefined, updatedAt: now });
+  const res = await fetch('/api/folders/members', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ stageId, folderId: folderId ?? null }),
+  });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as FolderRouteBody | null;
+    if (body?.error?.code === 'FOLDER_NOT_FOUND') {
+      throw new Error(`Folder not found: ${folderId}`);
+    }
+    throw folderRouteError(body);
   }
   log.info(`Set stage ${stageId} folder -> ${folderId ?? '(unfiled)'}`);
 }

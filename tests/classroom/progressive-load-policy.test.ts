@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   paneAvailabilityRetryDelay,
-  shouldResumeClassroomGeneration,
+  resolveClassroomSurfaceView,
 } from '@/lib/classroom/progressive-load-policy';
 
 describe('progressive classroom policy', () => {
@@ -15,29 +15,32 @@ describe('progressive classroom policy', () => {
       null,
     ]);
   });
+});
 
-  it.each([
-    { loading: true, error: null, transportPersistenceFenced: false, generationStarted: false },
-    {
-      loading: false,
-      error: 'failed',
-      transportPersistenceFenced: false,
-      generationStarted: false,
-    },
-    { loading: false, error: null, transportPersistenceFenced: true, generationStarted: false },
-    { loading: false, error: null, transportPersistenceFenced: false, generationStarted: true },
-  ])('blocks generation resume while progressive state is unsafe: %o', (state) => {
-    expect(shouldResumeClassroomGeneration(state)).toBe(false);
+describe('classroom surface view', () => {
+  const settledPane = {
+    variant: 'pane',
+    loading: false,
+    error: null,
+    notFound: false,
+    loadedClassroomId: null,
+    classroomId: 'stage-a',
+  } as const;
+
+  it('shows not-found after an absent pane load exhausts its retry schedule', () => {
+    expect(resolveClassroomSurfaceView({ ...settledPane, notFound: true })).toBe('not-found');
   });
 
-  it('allows generation resume only after loading and transport fencing settle', () => {
+  it('shows Retry after an unavailable pane load exhausts its retry schedule', () => {
     expect(
-      shouldResumeClassroomGeneration({
-        loading: false,
-        error: null,
-        transportPersistenceFenced: false,
-        generationStarted: false,
+      resolveClassroomSurfaceView({
+        ...settledPane,
+        error: 'Could not load this course',
       }),
-    ).toBe(true);
+    ).toBe('error');
+  });
+
+  it('keeps showing loading while a non-terminal pane waits for its classroom', () => {
+    expect(resolveClassroomSurfaceView(settledPane)).toBe('loading');
   });
 });

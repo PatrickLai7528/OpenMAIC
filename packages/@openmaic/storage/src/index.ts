@@ -47,6 +47,8 @@ export {
   ASSET_DESCRIPTOR_MEDIA_TYPE,
   AssetNotFoundError,
   AssetQuotaExceededError,
+  AssetImmutableError,
+  AssetRootedError,
   DEFAULT_RENDERABLE_TYPES,
   EXCLUDED_RENDERABLE_TYPES,
   type AssetBytes,
@@ -58,17 +60,31 @@ export {
 } from './asset/types.js';
 export type { AssetByteStore, AssetSignedReadHeaders } from './asset/byte-store.js';
 export {
+  ASSET_PG_MIGRATIONS,
   ASSET_PG_SCHEMA,
+  DEFAULT_ASSET_PENDING_TTL_MS,
+  DEFAULT_ASSET_STAGE_TTL_MS,
   PgAssetStore,
   ensureAssetSchema,
   type PgAssetStoreOptions,
+  type StagedAssetBytes,
 } from './asset/pg.js';
+// `./asset/references.js` is deliberately NOT re-exported. Its functions are
+// transaction-scoped maintenance primitives that replace and delete reference
+// rows; called outside a document write they would corrupt the table they
+// maintain. The supported surface is the two options -- PgDocumentStore's
+// `trackAssetReferences` and AssetCollector's `documentReferences` -- which is
+// everything a host needs to run the feature.
 export { PgAssetByteStore } from './asset/pg-bytes.js';
 export {
+  AssetCollectionFailure,
   AssetCollector,
+  AssetReferenceTrackingNotEnabledError,
   assertSignedUrlTtlWithinGrace,
   DEFAULT_ASSET_COLLECTION_BATCH_SIZE,
   DEFAULT_ASSET_COLLECTION_GRACE_MS,
+  DEFAULT_ASSET_REFERENCE_BACKFILL_BATCH_SIZE,
+  type AssetCollectionEntryLevelFailure,
   type AssetCollectionPass,
   type AssetCollectorOptions,
 } from './asset/collector.js';
@@ -92,10 +108,13 @@ export type {
   StageFreshnessManifest,
   StageFreshnessManifestStore,
 } from './document/types.js';
+export { StorageBusyError, isStorageBusyError } from './store-errors.js';
 export {
   DocumentFolderLimitError,
   DocumentNotFoundError,
   DocumentVersionError,
+  DocumentWriteRefusedError,
+  isDocumentWriteRefusedError,
 } from './document/types.js';
 export { BrowserDocumentStore, type BrowserDocumentStoreOptions } from './document/browser.js';
 export {
@@ -104,14 +123,35 @@ export {
   type HttpDocumentHeadersContext,
   type HttpDocumentHeadersHook,
   type HttpDocumentStoreOptions,
+  type HttpDocumentWriteOptions,
 } from './document/http.js';
 export {
+  SCHEMA_MIGRATION_LOCK_KEY,
+  SCHEMA_MIGRATIONS_TABLE,
+  SchemaMigrationChecksumError,
+  SchemaVersionAheadError,
+  applySchemaMigrations,
+  schemaMigrationChecksum,
+  type ApplySchemaMigrationsOptions,
+  type MigrationQueryable,
+  type SchemaMigration,
+  type SchemaMigrationSet,
+} from './pg-migrations.js';
+export {
   PgDocumentStore,
+  DOCUMENT_PG_MIGRATIONS,
   DOCUMENT_PG_SCHEMA,
+  DocumentAssetReferencesDisabledError,
+  StorageLockUnavailableError,
   ensureDocumentSchema,
   readStageFreshnessManifest,
+  reassignDocumentFolders,
   splitSqlStatements,
+  type DocumentFolderReassignment,
+  type DocumentOwnershipRelation,
   type PgDocumentStoreOptions,
+  type ReassignDocumentFoldersInput,
+  type StorageLockUnavailableReason,
 } from './document/pg.js';
 
 export type {
@@ -121,7 +161,11 @@ export type {
   RuntimeAppendOptions,
   RuntimeTailOptions,
 } from './runtime/types.js';
-export { RuntimeAppendConflictError } from './runtime/types.js';
+export {
+  RuntimeAppendConflictError,
+  RuntimeSessionExistsError,
+  RuntimeStageNotFoundError,
+} from './runtime/types.js';
 export { BrowserRuntimeStore, type BrowserRuntimeStoreOptions } from './runtime/browser.js';
 
 export {
@@ -151,6 +195,7 @@ export {
   type AgentSessionMessageEntry,
   type AgentSessionMeta,
   type AgentSessionStatus,
+  type AgentSessionSkillStore,
   type AgentSessionStore,
   type AgentSessionTitleStore,
   type AgentSessionTransaction,
@@ -199,9 +244,11 @@ export {
 export {
   DEFAULT_USER_SKILL_TABLE_NAMES,
   PgUserSkillStore,
+  USER_SKILL_PG_MIGRATIONS,
   USER_SKILL_PG_SCHEMA,
   ensureUserSkillSchema,
   type PgUserSkillStoreOptions,
+  type UserSkillOwnerMerge,
   type UserSkillTableNames,
 } from './skill/pg.js';
 
@@ -226,6 +273,7 @@ export {
   type MaterialExtractionFailureSettlement,
 } from './material/types.js';
 export {
+  AGENT_SESSION_MATERIAL_PG_MIGRATIONS,
   AGENT_SESSION_MATERIAL_PG_SCHEMA,
   DEFAULT_AGENT_SESSION_MATERIAL_TABLE_NAMES,
   PgAgentSessionMaterialStore,

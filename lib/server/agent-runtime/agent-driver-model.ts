@@ -1,15 +1,23 @@
 import type { Api, Model } from '@earendil-works/pi-ai';
+import { getModelInfo } from '@/lib/ai/providers';
+import type { ProviderId } from '@/lib/types/provider';
 
-import { getStageRoute } from '@/lib/server/model-routes';
-import { resolveModel, type ResolvedModel } from '@/lib/server/resolve-model';
+import { slotLanguageModel } from '@/lib/server/model-config/llm';
+import {
+  lookupSlot,
+  SlotDisabledError,
+  SlotUnassignedError,
+} from '@/lib/server/model-config/runtime';
+import type { ResolvedModel } from '@/lib/server/resolve-model';
+import { ContextBudgetError } from '@/lib/agent/runtime/context-budget-error';
 
 export const AGENT_DRIVER_STAGE = 'maic-agent-driver' as const;
 export const UNKNOWN_MODEL_RESERVED_OUTPUT_TOKENS = 8_192;
-// The driver route owns the model choice. This adapter only enforces its transport
-// contract: a resolvable provider prefix, no thinking effort, and an explicit
-// OpenAI-compatible pi api/dialect. The actual HTTP transport is selected by
+// The agent slot owns the model choice. This adapter only enforces its transport
+// contract: no thinking effort of its own and an OpenAI-compatible pi api/dialect. The actual HTTP transport is selected by
 // lib/ai/providers.ts.
 const OPENAI_PI_APIS = new Set<Api>(['openai-completions', 'openai-responses']);
+const DEFAULT_DRIVER_API: Api = 'openai-completions';
 
 export function buildPiDriverModel(
   connection: ResolvedModel,
@@ -18,7 +26,7 @@ export function buildPiDriverModel(
 ): Model<Api> {
   if (!configuredApi || !OPENAI_PI_APIS.has(configuredApi)) {
     throw new Error(
-      `MODEL_ROUTES stage "${AGENT_DRIVER_STAGE}" has unsupported pi api/dialect ` +
+      `The agent slot has unsupported pi api/dialect ` +
         `${JSON.stringify(configuredApi)} for model id ${connection.modelId}.`,
     );
   }
@@ -40,51 +48,113 @@ export function buildPiDriverModel(
     // Pi requires Model.maxTokens. For known models this is the real catalog
     // output window. For unknown models 8192 is only a deterministic internal
     // compaction reservation; resolveAgentDriverModel deliberately exposes an
-    // independent undefined wireMaxOutputTokens so it never becomes an API cap.
+    // independent undefined wireMaxOutputTokens when output capacity is unknown.
+    // Teaching reserves this space when preparing input too, but sends an
+    // output allowance only when the connector declares a real output window.
     maxTokens: connection.modelInfo?.outputWindow ?? UNKNOWN_MODEL_RESERVED_OUTPUT_TOKENS,
   } as Model<Api>;
 }
 
-/** Resolve the driver from its dedicated route; DEFAULT_MODEL is never consulted. */
-export async function resolveAgentDriverModel(): Promise<{
+/**
+ * Resolve the driver through the `agent` slot for `workspaceId` (where an
+ * older deployment's translated defaults leave the agent off). The slot requires tool calling; a model the catalogue says lacks it is
+ * refused. The transport dialect defaults to openai-completions.
+ */
+export async function resolveAgentDriverModel(workspaceId: string | null = null): Promise<{
   connection: ResolvedModel;
   piModel: Model<Api>;
-  /** Catalog-backed API limit; undefined means omit max_tokens on the wire. */
+  /** Catalog limit clamped to the context window; undefined omits max_tokens on the wire. */
   wireMaxOutputTokens?: number;
   /** Internal compaction output-space estimate; never used as a conversation API limit. */
   reservedOutputTokens: number;
+  /** Teaching prepares one request that either configured slot target can serve. */
+  teaching: { piModel: Model<Api>; wireMaxOutputTokens?: number };
 }> {
-  const route = getStageRoute(AGENT_DRIVER_STAGE);
-  if (!route) {
+  const resolution = await lookupSlot('agent', workspaceId);
+  if (resolution.status === 'disabled') throw new SlotDisabledError('agent');
+  if (resolution.status === 'unassigned') throw new SlotUnassignedError('agent');
+  if (resolution.requirements.some((check) => check.status === 'unmet')) {
     throw new Error(
-      `MODEL_ROUTES must explicitly configure stage "${AGENT_DRIVER_STAGE}" ` +
-        `with a provider-prefixed model id and an api/dialect.`,
+      `The agent model ${resolution.modelId} does not support tool calling; choose another model for the agent.`,
     );
   }
-  // The provider prefix must be explicit. parseModelString silently defaults a
-  // bare model id to the openai provider, so the driver must fail here before
-  // resolveModel reaches that fallback and routes to the wrong provider.
-  const providerSeparator = route.model.indexOf(':');
-  const modelId = providerSeparator > 0 ? route.model.slice(providerSeparator + 1) : undefined;
-  if (!modelId) {
+  // An effort inherited from an ancestor was already dropped by the
+  // resolution, and saving refuses one on the slot itself; this backstop only
+  // catches a configuration stored before that check existed.
+  if (resolution.thinking?.effort !== undefined) {
     throw new Error(
-      `MODEL_ROUTES stage "${AGENT_DRIVER_STAGE}" must use a model id with an explicit ` +
-        `provider prefix; ` +
-        `received ${JSON.stringify(route.model)}.`,
+      `The agent slot must not set thinking.effort because ${resolution.modelId} ` +
+        `cannot combine reasoning_effort with function tools on this transport. ` +
+        `Remove the thinking effort from the agent slot.`,
     );
   }
-  if (route.thinking?.effort !== undefined) {
-    throw new Error(
-      `MODEL_ROUTES stage "${AGENT_DRIVER_STAGE}" must not set thinking.effort because ` +
-        `${modelId} cannot combine reasoning_effort with function tools on this transport.`,
-    );
+  const connection = await slotLanguageModel(resolution);
+  const piModel = buildPiDriverModel(
+    connection,
+    resolution.api ?? DEFAULT_DRIVER_API,
+    resolution.contextWindow,
+  );
+  // Reconcile the output reservation with the effective context window so the
+  // conversation, its compaction summary and the context budget check agree.
+  // Only a reservation that consumes the entire window is repaired (to half
+  // the window, sent on the wire too); every other cap is kept as configured.
+  const outputCeiling = Math.floor(piModel.contextWindow / 2);
+  const requestedOutput =
+    connection.modelInfo?.outputWindow ?? UNKNOWN_MODEL_RESERVED_OUTPUT_TOKENS;
+  if (
+    !Number.isFinite(outputCeiling) ||
+    outputCeiling < 1 ||
+    !Number.isFinite(requestedOutput) ||
+    requestedOutput < 1
+  ) {
+    throw new ContextBudgetError('invalid_output_budget');
   }
-  const connection = await resolveModel({ stage: AGENT_DRIVER_STAGE });
-  const wireMaxOutputTokens = connection.modelInfo?.outputWindow;
+  const needsOutputFallback = requestedOutput >= piModel.contextWindow;
+  const reservedOutputTokens = needsOutputFallback ? outputCeiling : requestedOutput;
+  const wireMaxOutputTokens =
+    connection.modelInfo?.outputWindow !== undefined || needsOutputFallback
+      ? reservedOutputTokens
+      : undefined;
+  piModel.maxTokens = reservedOutputTokens;
+  const capacity = (value: number | undefined) =>
+    value !== undefined && Number.isFinite(value) && value >= 1 ? Math.floor(value) : undefined;
+  const fallback = resolution.fallbackRequirements?.some((check) => check.status === 'unmet')
+    ? undefined
+    : resolution.fallback;
+  const fallbackInfo =
+    fallback?.catalogue !== false && fallback?.modelId
+      ? getModelInfo(fallback.registryId as ProviderId, fallback.modelId)
+      : undefined;
+  const primaryOutput = capacity(wireMaxOutputTokens);
+  const fallbackOutput = capacity(fallbackInfo?.outputWindow);
+  // Do not copy a primary-only allowance/window to a smaller fallback. Unknown
+  // metadata keeps max_tokens omitted, just as for an unknown primary. The
+  // existing 128K/8192 estimates remain input-planning estimates only.
+  const teaching = {
+    piModel: fallback
+      ? {
+          ...piModel,
+          contextWindow: Math.min(
+            capacity(piModel.contextWindow) ?? 128_000,
+            capacity(fallbackInfo?.contextWindow) ?? 128_000,
+          ),
+          maxTokens: Math.min(
+            primaryOutput ?? UNKNOWN_MODEL_RESERVED_OUTPUT_TOKENS,
+            fallbackOutput ?? UNKNOWN_MODEL_RESERVED_OUTPUT_TOKENS,
+          ),
+        }
+      : piModel,
+    wireMaxOutputTokens: fallback
+      ? primaryOutput && fallbackOutput
+        ? Math.min(primaryOutput, fallbackOutput)
+        : undefined
+      : primaryOutput,
+  };
   return {
     connection,
-    piModel: buildPiDriverModel(connection, route.api, route.contextWindow),
+    piModel,
     wireMaxOutputTokens,
-    reservedOutputTokens: wireMaxOutputTokens ?? UNKNOWN_MODEL_RESERVED_OUTPUT_TOKENS,
+    reservedOutputTokens,
+    teaching,
   };
 }

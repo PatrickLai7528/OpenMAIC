@@ -229,3 +229,10 @@ Return ONLY the HTML document, no markdown fences or explanations.
 - [ ] **NO DUPLICATED HTML** - exactly ONE `<!DOCTYPE html>` tag
 - [ ] **Python stdout uses correct import pattern** - imports BOTH `sys` AND `io`
 - [ ] **Pyodide uses async execution** - `runPythonAsync()` not `runPython()`
+
+
+{{snippet:interactive-libraries}}
+
+{{snippet:interactive-math}}
+
+{{snippet:interactive-observation}}

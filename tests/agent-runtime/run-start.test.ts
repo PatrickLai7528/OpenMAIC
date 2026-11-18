@@ -92,6 +92,43 @@ describe('planRunStart', () => {
     ).toEqual({ kind: 'continue' });
   });
 
+  it('starts over after runs that left the tree empty, keeping the opening message apart from follow-ups', () => {
+    const opening = { text: 'Build a lesson', durableMessageSeq: 1 };
+    const followUp = { text: 'Please try again', durableMessageSeq: 4 };
+    // Created with opening context: the opening message precedes the first run.
+    expect(
+      planRunStart({
+        plan: planResume(null),
+        claimReason: 'queued',
+        pending: [opening, followUp],
+        prompt: 'Build a lesson',
+        firstRunSeq: 2,
+      }),
+    ).toEqual({ kind: 'prompt', text: 'Build a lesson', durableMessageSeq: 1 });
+    // Created without one: a message posted after the first run is a
+    // follow-up, so the session's own prompt starts and consumes nothing.
+    expect(
+      planRunStart({
+        plan: planResume(null),
+        claimReason: 'queued',
+        pending: [followUp],
+        prompt: 'Build a lesson',
+        firstRunSeq: 2,
+      }),
+    ).toEqual({ kind: 'prompt', text: 'Build a lesson' });
+    // An idle attachment's first message is its opening as long as it came first.
+    expect(
+      planRunStart({
+        plan: planResume(null),
+        claimReason: 'queued',
+        pending: [{ text: 'Shorten the second section', durableMessageSeq: 1 }, followUp],
+        prompt: 'Existing lesson',
+        idleAttach: true,
+        firstRunSeq: 2,
+      }),
+    ).toEqual({ kind: 'prompt', text: 'Shorten the second section', durableMessageSeq: 1 });
+  });
+
   it('prompts an answer after an ask checkpoint even when the claim is orphaned', () => {
     const plan = planResume([user('Start'), askUserResult()]);
     expect(plan.kind).toBe('already-complete');
@@ -103,6 +140,77 @@ describe('planRunStart', () => {
         prompt: 'Start',
       }),
     ).toEqual({ kind: 'prompt', text: 'Continue' });
+  });
+
+  it('includes the opening attachment note on the first user message', () => {
+    const materials = [
+      {
+        materialId: 'material-1',
+        originalName: 'lecture.mp4',
+        mime: 'video/mp4',
+        bytes: 10,
+      },
+    ];
+    const prompt = 'Build a lesson from the recording';
+    const opening = {
+      text: 'durable opening text',
+      durableMessageSeq: 1,
+      materials,
+    };
+    const courseRefs = [{ kind: 'course' as const, stageId: 'stage-1', title: '光的折射' }];
+    const elementRefs: ElementRef[] = [
+      {
+        kind: 'slide-element',
+        stageId: 'stage-1',
+        sceneId: 'scene-2',
+        elementId: 'title-1',
+        elementType: 'text',
+        label: 'Text · Old title',
+        snapshotText: 'Old title',
+      },
+    ];
+    const start = {
+      plan: planResume(null),
+      claimReason: 'queued' as const,
+      prompt,
+    };
+    const followUpNote = composeFollowUpText({ text: 'later', materials }).slice('later'.length);
+
+    for (const extra of [{}, { courseRefs }, { elementRefs }, { courseRefs, elementRefs }]) {
+      const pending = { ...opening, ...extra };
+      const text = composeFollowUpText({ ...pending, text: prompt });
+      expect(text.startsWith(prompt)).toBe(true);
+      expect(text).toContain(followUpNote);
+      expect(
+        planRunStart({
+          ...start,
+          pending: [pending],
+        }),
+      ).toEqual({ kind: 'prompt', text, durableMessageSeq: 1 });
+    }
+  });
+
+  it('keeps an idle attachment on the opening message, including its files', () => {
+    const opening = {
+      text: 'Shorten the second section',
+      materials: [
+        {
+          materialId: 'material-1',
+          originalName: 'lecture.mp4',
+          mime: 'video/mp4',
+          bytes: 10,
+        },
+      ],
+    };
+    expect(
+      planRunStart({
+        plan: planResume(null),
+        claimReason: 'queued',
+        pending: [opening],
+        prompt: 'Existing lesson',
+        idleAttach: true,
+      }),
+    ).toEqual({ kind: 'prompt', text: composeFollowUpText(opening) });
   });
 });
 

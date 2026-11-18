@@ -12,28 +12,24 @@ import { Type, type Static } from 'typebox';
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 
 import { formatSearchResultsAsContext, searchWeb } from '@/lib/web-search';
-import { resolveClassroomWebSearchConfig } from '@/lib/server/web-search-config';
+import {
+  resolveClassroomWebSearchConfig,
+  type WebSearchConfig,
+} from '@/lib/server/web-search-config';
 
-export interface WebSearchCapability {
-  providerId: Parameters<typeof searchWeb>[0]['providerId'];
-  apiKey: string;
-  baseUrl?: string;
-}
+/** The resolved search configuration, forwarded whole (model, sub-sources, endpoint). */
+export type WebSearchCapability = WebSearchConfig;
 
-/** This deployment's web-search capability, or null when unconfigured. */
-export function resolveWebSearchCapability(): WebSearchCapability | null {
+/** The web-search capability for a workspace, or null when unconfigured or off. */
+export async function resolveWebSearchCapability(
+  workspaceId: string | null,
+): Promise<WebSearchCapability | null> {
   // The resolver's own per-provider rules decide usability — including
   // keyless providers (brave/searxng carry no apiKey by definition) and the
   // capability force-off plumbing (a disabled-only config resolves to nothing).
   // An extra non-empty-key check here would silently unregister web_search on
   // exactly the keyless deployments.
-  const config = resolveClassroomWebSearchConfig({});
-  if (!config) return null;
-  return {
-    providerId: config.providerId,
-    apiKey: config.apiKey,
-    ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
-  };
+  return (await resolveClassroomWebSearchConfig(workspaceId)) ?? null;
 }
 
 const SEARCH_SCHEMA = Type.Object({
@@ -41,9 +37,12 @@ const SEARCH_SCHEMA = Type.Object({
 });
 
 export function buildWebSearchTool(
-  capability: WebSearchCapability,
+  capability: WebSearchCapability | null | undefined,
   onUrlsObserved?: (urls: string[]) => Promise<void>,
-): AgentTool<never, never> {
+): AgentTool<never, never> & {
+  capability: 'web_search';
+  promptBlock: string;
+} {
   const tool: AgentTool<typeof SEARCH_SCHEMA, unknown> = {
     name: 'web_search',
     label: 'Search the web',
@@ -53,15 +52,14 @@ export function buildWebSearchTool(
       'already know. Prefer one precise query over several vague ones.',
     parameters: SEARCH_SCHEMA,
     async execute(_id, params: Static<typeof SEARCH_SCHEMA>, signal) {
+      if (!capability) throw new Error('web_search is not configured');
       // The abort signal is the pi loop's per-run signal (the same one
       // agent.abort() fires); the provider fetch below carries it too, so an
       // in-flight request is cut short rather than merely abandoned.
       if (signal?.aborted) throw new Error('aborted');
       const result = await searchWeb({
-        providerId: capability.providerId,
+        ...capability,
         query: params.query,
-        apiKey: capability.apiKey,
-        ...(capability.baseUrl ? { baseUrl: capability.baseUrl } : {}),
         ...(signal ? { signal } : {}),
       });
       if (signal?.aborted) throw new Error('aborted');
@@ -82,7 +80,10 @@ export function buildWebSearchTool(
       };
     },
   };
-  return tool as unknown as AgentTool<never, never>;
+  return Object.assign(tool as unknown as AgentTool<never, never>, {
+    capability: 'web_search' as const,
+    promptBlock: searchPromptBlock(),
+  });
 }
 
 /**

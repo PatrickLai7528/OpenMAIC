@@ -1,22 +1,19 @@
 import { execFile } from 'node:child_process';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { access, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, extname, join, resolve as resolvePath } from 'node:path';
 
 import { transcribeAudio, type ASRTranscriptionResult } from '@/lib/audio/asr-providers';
-import type { ASRModelConfig, ASRProviderId } from '@/lib/audio/types';
-import {
-  resolveASRApiKey,
-  resolveASRBaseUrl,
-  resolveASRModel,
-  resolveServerASRProviderId,
-} from '@/lib/server/provider-config';
+import { ASR_PROVIDERS } from '@/lib/audio/constants';
+import type { ASRModelConfig, BuiltInASRProviderId } from '@/lib/audio/types';
+
+import { MEDIA_MAX_DURATION_SEC } from '@/lib/types/media-limits';
 
 import { LOCAL_FFMPEG_MEDIA_MIMES } from '../mime';
 import type {
   DocumentAsset,
+  DocumentExtractorConfig,
   MediaArtifact,
   MediaExtractorInput,
   MediaExtractorProvider,
@@ -28,18 +25,28 @@ import {
 } from '../../server/material-extraction/errors';
 import { MAX_DERIVED_IMAGES, prepareDerivedImage } from './images';
 import { getMediaExtractorManifestEntry } from './manifest';
+import { asrFetchSignal } from '@/lib/audio/asr-fetch-signal';
 
 export const MEDIA_ASR_CHUNK_SEC = 600;
+
+/**
+ * The ASR chunk duration for a provider: its declared `maxChunkSeconds`
+ * (see `ASRProviderConfig`) when the provider bounds its input payload,
+ * otherwise the generic default. The provider registry is neutral — no
+ * vendor ids are named here.
+ */
+export function mediaASRChunkSec(providerId?: string): number {
+  const config = providerId ? ASR_PROVIDERS[providerId as BuiltInASRProviderId] : undefined;
+  return config?.maxChunkSeconds || MEDIA_ASR_CHUNK_SEC;
+}
 const MEDIA_COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
 const FFPROBE_TIMEOUT_MS = 30_000;
 const MEDIA_JOB_TIMEOUT_MS = 45 * 60 * 1000;
 const MEDIA_ASR_TIMEOUT_MS = 8 * 60 * 1000;
-const MEDIA_MAX_DURATION_SEC = 90 * 60;
 const COMMAND_MAX_BUFFER = 8 * 1024 * 1024;
 const MAX_KEYFRAME_CANDIDATES = 50_000;
 const KEYFRAME_END_SAFETY_MS = 1500;
 const MEDIA_MIME_SET = new Set<string>(LOCAL_FFMPEG_MEDIA_MIMES);
-const asrFetchSignal = new AsyncLocalStorage<AbortSignal>();
 let abortableFetchInstalled = false;
 
 export type MediaExtractionStage = 'probing' | 'audio' | 'asr' | 'keyframes';
@@ -57,7 +64,13 @@ export interface MediaCommandResult {
 
 export interface MediaCommandRunner {
   resolve(name: 'ffmpeg' | 'ffprobe'): Promise<string>;
-  run(file: string, args: string[], timeoutMs: number): Promise<MediaCommandResult>;
+  /** `signal` kills the command when the caller stops waiting. */
+  run(
+    file: string,
+    args: string[],
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<MediaCommandResult>;
 }
 
 export interface LocalMediaExtractorDependencies {
@@ -84,7 +97,11 @@ export interface MediaProbe {
 class MediaJobDeadline {
   private readonly expiresAt: number;
 
-  constructor(timeoutMs: number) {
+  /** `signal`: the caller stopped waiting, which ends the job like its deadline. */
+  constructor(
+    timeoutMs: number,
+    readonly signal?: AbortSignal,
+  ) {
     this.expiresAt = Date.now() + timeoutMs;
   }
 
@@ -93,6 +110,7 @@ class MediaJobDeadline {
   }
 
   check(): void {
+    this.signal?.throwIfAborted();
     if (this.remainingMs() <= 0) {
       throw new MaterialExtractionError('media extraction job deadline exceeded', true);
     }
@@ -134,17 +152,26 @@ async function runASRWithTimeout<T>(run: () => Promise<T>, deadline: MediaJobDea
     true,
   );
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       controller.abort(timeoutError);
       reject(timeoutError);
     }, timeoutMs);
     timer.unref?.();
+    // The caller stopped waiting: the request in flight is aborted too.
+    onAbort = () => {
+      const reason = deadline.signal?.reason ?? new DOMException('Aborted', 'AbortError');
+      controller.abort(reason);
+      reject(reason);
+    };
+    deadline.signal?.addEventListener('abort', onAbort, { once: true });
   });
   try {
     return await Promise.race([asrFetchSignal.run(controller.signal, run), timeout]);
   } finally {
     if (timer) clearTimeout(timer);
+    if (onAbort) deadline.signal?.removeEventListener('abort', onAbort);
   }
 }
 
@@ -158,10 +185,11 @@ async function runMediaCommand(
   const timeoutMs = deadline.commandTimeoutMs(maximumTimeoutMs);
   const jobLimited = timeoutMs < maximumTimeoutMs;
   try {
-    const result = await commands.run(file, args, timeoutMs);
+    const result = await commands.run(file, args, timeoutMs, deadline.signal);
     deadline.check();
     return result;
   } catch (error) {
+    deadline.signal?.throwIfAborted();
     if (deadline.remainingMs() <= 0) deadline.check();
     const commandError = error as NodeJS.ErrnoException & { killed?: boolean };
     if (jobLimited && (commandError.code === 'ETIMEDOUT' || commandError.killed)) {
@@ -199,31 +227,66 @@ async function resolveExecutable(name: 'ffmpeg' | 'ffprobe'): Promise<string> {
   );
 }
 
+/** How long a cancelled command gets to exit on SIGTERM before it is killed. */
+export const MEDIA_COMMAND_KILL_GRACE_MS = 2_000;
+
+/**
+ * Run one command. A caller that stops waiting (`signal`) has the process
+ * terminated (SIGTERM, then SIGKILL after {@link MEDIA_COMMAND_KILL_GRACE_MS})
+ * and gets the rejection only once it has exited, so a worker slot is never
+ * released while ffmpeg still runs.
+ */
+export function runMediaCommandProcess(
+  file: string,
+  args: string[],
+  timeoutMs: number,
+  signal?: AbortSignal,
+  killGraceMs: number = MEDIA_COMMAND_KILL_GRACE_MS,
+): Promise<MediaCommandResult> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    let aborted = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const child = execFile(
+      file,
+      args,
+      { timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, encoding: 'utf8' },
+      (error, stdout, stderr) => {
+        if (aborted) return;
+        signal?.removeEventListener('abort', onAbort);
+        if (error) {
+          const detail = String(stderr || stdout || error.message)
+            .trim()
+            .slice(-4000);
+          const wrapped = new Error(`${basename(file)} failed: ${detail || error.message}`, {
+            cause: error,
+          }) as Error & { code?: string };
+          wrapped.code = (error as NodeJS.ErrnoException).code;
+          reject(wrapped);
+          return;
+        }
+        resolve({ stdout: String(stdout), stderr: String(stderr) });
+      },
+    );
+    const onAbort = () => {
+      aborted = true;
+      child.once('close', () => {
+        if (killTimer) clearTimeout(killTimer);
+        reject(signal!.reason ?? new DOMException('Aborted', 'AbortError'));
+      });
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => child.kill('SIGKILL'), killGraceMs);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 export const defaultMediaCommands: MediaCommandRunner = {
   resolve: resolveExecutable,
-  run(file, args, timeoutMs) {
-    return new Promise((resolve, reject) => {
-      execFile(
-        file,
-        args,
-        { timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, encoding: 'utf8' },
-        (error, stdout, stderr) => {
-          if (error) {
-            const detail = String(stderr || stdout || error.message)
-              .trim()
-              .slice(-4000);
-            const wrapped = new Error(`${basename(file)} failed: ${detail || error.message}`, {
-              cause: error,
-            }) as Error & { code?: string };
-            wrapped.code = (error as NodeJS.ErrnoException).code;
-            reject(wrapped);
-            return;
-          }
-          resolve({ stdout: String(stdout), stderr: String(stderr) });
-        },
-      );
-    });
-  },
+  run: (file, args, timeoutMs, signal) => runMediaCommandProcess(file, args, timeoutMs, signal),
 };
 
 export function parseMediaProbe(stdout: string): MediaProbe {
@@ -274,12 +337,15 @@ export interface MediaChunkWindow {
   endMs: number;
 }
 
-export function mediaChunkWindows(durationSec: number): MediaChunkWindow[] {
-  const count = Math.max(1, Math.ceil(durationSec / MEDIA_ASR_CHUNK_SEC));
+export function mediaChunkWindows(
+  durationSec: number,
+  chunkSec: number = MEDIA_ASR_CHUNK_SEC,
+): MediaChunkWindow[] {
+  const count = Math.max(1, Math.ceil(durationSec / chunkSec));
   return Array.from({ length: count }, (_, index) => ({
     index,
-    startMs: index * MEDIA_ASR_CHUNK_SEC * 1000,
-    endMs: Math.min(durationSec * 1000, (index + 1) * MEDIA_ASR_CHUNK_SEC * 1000),
+    startMs: index * chunkSec * 1000,
+    endMs: Math.min(durationSec * 1000, (index + 1) * chunkSec * 1000),
   }));
 }
 
@@ -400,28 +466,29 @@ function sourceExtension(mime: string): string {
   return extensions[mime] ?? '.media';
 }
 
-function derivedStem(originalName: string | null, fallback: string): string {
+/** The name of a keyframe taken `timeMs` into the source named `stem`. */
+export function keyframeTitle(stem: string, timeMs: number): string {
+  return `${stem} at ${(timeMs / 1000).toFixed(3)} seconds`;
+}
+
+/** A source's file name without its extension, for naming what is derived from it. */
+export function derivedStem(originalName: string | null, fallback: string): string {
   if (!originalName) return fallback;
   const name = basename(originalName);
   const extension = extname(name);
   return extension ? name.slice(0, -extension.length) : name;
 }
 
-function configuredASR(): ASRModelConfig {
-  const providerId = resolveServerASRProviderId();
-  if (!providerId) {
+/** The asr slot's connection the server resolved for this extraction. */
+function configuredASR(config: DocumentExtractorConfig): ASRModelConfig {
+  if (config.asrError) throw config.asrError;
+  if (!config.asr) {
     throw new MaterialExtractionError(
-      'No server ASR provider is configured for local media extraction',
+      'No speech recognition provider is configured for local media extraction',
       false,
     );
   }
-  return {
-    providerId: providerId as ASRProviderId,
-    modelId: resolveASRModel(providerId),
-    apiKey: resolveASRApiKey(providerId) || undefined,
-    baseUrl: resolveASRBaseUrl(providerId),
-    language: 'auto',
-  };
+  return { ...config.asr, language: config.asr.language ?? 'auto' };
 }
 
 function frameTimes(stderr: string): number[] {
@@ -541,7 +608,10 @@ export async function extractMediaMaterial(
     throw new MaterialExtractionError(`Unsupported media MIME type: ${input.mimeType}`, false);
   }
   const startedAt = Date.now();
-  const deadline = new MediaJobDeadline(dependencies.jobTimeoutMs ?? MEDIA_JOB_TIMEOUT_MS);
+  const deadline = new MediaJobDeadline(
+    dependencies.jobTimeoutMs ?? MEDIA_JOB_TIMEOUT_MS,
+    input.config.signal,
+  );
   const commands = dependencies.commands ?? defaultMediaCommands;
   const transcribe = dependencies.transcribe ?? transcribeAudio;
   const sessionDir = await deadline.beforeAwait(() => mkdtemp(join(tmpdir(), 'openmaic-media-')));
@@ -557,6 +627,7 @@ export async function extractMediaMaterial(
       throw new MaterialExtractionError(
         `Media duration ${Math.ceil(durationSec)} seconds exceeds the ${MEDIA_MAX_DURATION_SEC}-second limit; trim it before uploading`,
         false,
+        { reasonCode: 'media_too_long' },
       );
     }
 
@@ -616,10 +687,14 @@ export async function extractMediaMaterial(
       }
 
       const chunkPattern = join(sessionDir, 'chunk-%03d.wav');
+      const asr = dependencies.resolveASRConfig?.() ?? configuredASR(input.config);
+      const asrChunkSec = mediaASRChunkSec(asr.providerId);
       try {
         await runMediaCommand(
           commands,
           ffmpeg,
+          // The ASR provider decides how long a chunk may be: its resolved
+          // config exists before the split because -segment_time must match.
           [
             '-hide_banner',
             '-loglevel',
@@ -637,7 +712,7 @@ export async function extractMediaMaterial(
             '-f',
             'segment',
             '-segment_time',
-            String(MEDIA_ASR_CHUNK_SEC),
+            String(asrChunkSec),
             '-reset_timestamps',
             '1',
             chunkPattern,
@@ -655,7 +730,7 @@ export async function extractMediaMaterial(
       if (chunkPaths.length === 0) {
         throw new MaterialExtractionError('ffmpeg produced no ASR audio chunks', false);
       }
-      const windows = mediaChunkWindows(transcriptDurationSec);
+      const windows = mediaChunkWindows(transcriptDurationSec, asrChunkSec);
       if (chunkPaths.length !== windows.length) {
         throw new MaterialExtractionError(
           `ffmpeg produced ${chunkPaths.length} ASR chunks; expected ${windows.length} for ${transcriptDurationSec} seconds`,
@@ -663,7 +738,6 @@ export async function extractMediaMaterial(
         );
       }
       asrChunks = chunkPaths.length;
-      const asr = dependencies.resolveASRConfig?.() ?? configuredASR();
       segments = await deadline.beforeAwait(() =>
         transcribeChunks(chunkPaths, windows, asr, transcribe, deadline),
       );
@@ -747,10 +821,10 @@ export async function extractMediaMaterial(
             id: assetId,
             type: 'image',
             mimeType: prepared.mime,
-            data: prepared.buffer.toString('base64'),
+            data: `data:${prepared.mime};base64,${prepared.buffer.toString('base64')}`,
             width: prepared.width,
             height: prepared.height,
-            description: `${stem} at ${(timeMs / 1000).toFixed(3)} seconds`,
+            description: keyframeTitle(stem, timeMs),
             metadata: { timeMs },
           };
           keyframes.push({ asset, timeMs });

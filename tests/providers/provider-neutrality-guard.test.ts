@@ -38,6 +38,7 @@ const REGISTRY_SOURCES: readonly RegistrySource[] = [
   { file: 'lib/media/image-providers.ts', declarations: ['IMAGE_PROVIDERS'] },
   { file: 'lib/media/video-providers.ts', declarations: ['VIDEO_PROVIDERS'] },
   { file: 'lib/web-search/constants.ts', declarations: ['WEB_SEARCH_PROVIDERS'] },
+  { file: 'lib/web-fetch/registry.ts', declarations: ['WEB_FETCH_PROVIDERS'] },
   { file: 'lib/pdf/constants.ts', declarations: ['PDF_PROVIDERS'] },
   {
     file: 'lib/document/extractors/manifest.ts',
@@ -56,6 +57,9 @@ const PACKAGE_EXPORT_SOURCES = [
  * places where concrete provider knowledge belongs.
  */
 const PROVIDER_NEUTRAL_FILES = [
+  'lib/server/generation/run/engine.ts',
+  'lib/server/generation/run/failure-code.ts',
+  'lib/server/agent-runtime/scene-tts.ts',
   // LLM stage routing and agent driver
   'lib/server/model-routes.ts',
   'lib/server/resolve-model.ts',
@@ -63,7 +67,6 @@ const PROVIDER_NEUTRAL_FILES = [
   // NOTE: lib/server/agent-runtime/agent-driver-model.ts is not on main yet.
   // Add it back here the moment the agent driver lands on main so the neutral
   // driver surface is guarded from day one.
-  'lib/orchestration/ai-sdk-adapter.ts',
   // Capability routes
   'app/api/generate/tts/route.ts',
   'app/api/generate/voice/route.ts',
@@ -72,10 +75,15 @@ const PROVIDER_NEUTRAL_FILES = [
   'app/api/generate/video/route.ts',
   'app/api/verify-image-provider/route.ts',
   'app/api/verify-video-provider/route.ts',
-  'app/api/web-search/route.ts',
-  'app/api/extract-document/route.ts',
   'app/api/parse-pdf/route.ts',
+  // The generation steps (lib/server/generation/steps)
+  'lib/server/generation/steps/narration.ts',
+  'lib/server/generation/steps/image.ts',
+  'lib/server/generation/steps/video.ts',
+  'lib/server/generation/steps/research.ts',
+  'lib/server/generation/steps/material-analysis.ts',
   'lib/audio/voice-registration-client.ts',
+  'lib/server/agent-runtime/fetch-url.ts',
   'lib/web-search/index.ts',
   'lib/server/web-search-config.ts',
   // Registry-based document dispatch
@@ -94,6 +102,20 @@ const PROVIDER_NEUTRAL_FILES = [
  * another use of an already-allowed vendor therefore still fails the guard.
  */
 const TEMPORARY_ALLOWLIST: readonly AllowedLeak[] = [
+  {
+    file: 'lib/server/generation/run/engine.ts',
+    vendor: 'pg',
+    token: "'@openmaic/storage/document/pg'",
+    count: 1,
+    reason: 'Existing storage Queryable type import; not audio provider policy.',
+  },
+  {
+    file: 'lib/server/generation/run/engine.ts',
+    vendor: 'qwen',
+    token: "'QWEN_VC_VOICE_NOT_FOUND'",
+    count: 1,
+    reason: 'Existing main missing-clone fallback; incompatible-voice policy must remain neutral.',
+  },
   {
     file: 'lib/server/resolve-model.ts',
     vendor: 'bedrock',
@@ -166,23 +188,27 @@ const TEMPORARY_VENDOR_DEBT: readonly AllowedVendorDebt[] = [
     'lib/server/provider-config.ts',
     'Temporary: provider configuration is still a mixed catalog and resolver composition root.',
     [
-      ['qwen', 20],
-      ['openai', 23],
+      // Includes the retired grouping sentinel import and exact migration comparison.
+      ['qwen', 22],
+      ['openai', 24],
       ['azure', 6],
       ['atlascloud', 2],
       ['anthropic', 2],
-      ['google', 2],
-      ['deepseek', 2],
-      ['kimi', 2],
+      ['google', 4],
+      // The TTS_/ASR_DEEPSEEK env maps.
+      ['deepseek', 8],
+      ['kimi', 4],
       ['minimax', 13],
-      ['glm', 4],
+      ['glm', 6],
       ['siliconflow', 2],
       ['doubao', 6],
-      ['openrouter', 2],
+      ['openrouter', 6],
       ['grok', 6],
       ['tencent', 4],
       ['hunyuan', 3],
-      ['xiaomi', 3],
+      // TTS_XIAOMI/ASR_XIAOMI in the provider-config env maps (#1432 follow-up).
+      ['xiaomi', 7],
+      ['tokendance', 2],
       ['ollama', 3],
       ['lemonade', 12],
       ['bedrock', 29],
@@ -190,17 +216,15 @@ const TEMPORARY_VENDOR_DEBT: readonly AllowedVendorDebt[] = [
       ['elevenlabs', 2],
       ['whisper', 1],
       ['funasr', 3],
-      ['unpdf', 2],
-      ['mineru', 5],
       ['seedream', 2],
       ['banana', 2],
       ['nano', 2],
       ['seedance', 2],
       ['kling', 2],
-      ['veo', 2],
       ['happyhorse', 2],
       ['tavily', 7],
       ['exa', 5],
+      ['firecrawl', 5],
       ['bocha', 5],
       ['brave', 3],
       ['baidu', 5],
@@ -214,27 +238,20 @@ const TEMPORARY_VENDOR_DEBT: readonly AllowedVendorDebt[] = [
   ),
   ...groupedDebt(
     'app/api/generate/tts/route.ts',
-    'Temporary: TTS request preparation and error behavior have not moved behind adapters.',
+    'Temporary: TTS error behavior has not moved behind adapters.',
     [
-      ['qwen', 14],
-      ['voxcpm', 12],
-      ['browser-native-tts', 2],
-      ['browser-native', 2],
+      ['qwen', 7],
+      ['voxcpm', 1],
     ],
   ),
   ...groupedDebt(
-    'app/api/web-search/route.ts',
-    'Temporary: web-search credentials and request options have not moved behind adapters.',
+    'lib/server/generation/steps/narration.ts',
+    'Temporary: TTS request preparation has not moved behind adapters.',
     [
-      ['baidu', 9],
-      ['claude', 8],
-      ['tavily', 3],
-      ['searxng', 5],
-      ['bocha', 2],
-      ['brave', 2],
-      ['minimax', 2],
-      ['doubao', 2],
-      ['exa', 2],
+      ['qwen', 5],
+      ['voxcpm', 11],
+      ['browser-native-tts', 2],
+      ['browser-native', 2],
     ],
   ),
   ...groupedDebt(
@@ -243,8 +260,8 @@ const TEMPORARY_VENDOR_DEBT: readonly AllowedVendorDebt[] = [
     [['local', 3]],
   ),
   ...groupedDebt(
-    'app/api/extract-document/route.ts',
-    'Temporary: managed document-provider configuration and fallback policy remain in the route.',
+    'lib/server/generation/steps/material-analysis.ts',
+    'Temporary: managed document-provider configuration and fallback policy remain in material analysis.',
     [
       ['alidocmind', 6],
       ['mineru', 15],
@@ -275,6 +292,8 @@ const TEMPORARY_VENDOR_DEBT: readonly AllowedVendorDebt[] = [
     'lib/web-search/index.ts',
     'Temporary: web-search execution still uses a central provider switch.',
     [
+      ['deepseek', 4],
+      ['kimi', 4],
       ['baidu', 9],
       ['bocha', 4],
       ['brave', 4],
@@ -284,22 +303,26 @@ const TEMPORARY_VENDOR_DEBT: readonly AllowedVendorDebt[] = [
       ['searxng', 4],
       ['tavily', 4],
       ['exa', 4],
+      ['firecrawl', 4],
     ],
   ),
   ...groupedDebt(
     'lib/server/web-search-config.ts',
     'Temporary: web-search URL and option validation are still provider-specific.',
     [
-      ['baidu', 11],
+      ['deepseek', 1],
+      ['kimi', 1],
+      ['baidu', 8],
       ['tavily', 3],
       ['bocha', 7],
       ['brave', 4],
-      ['claude', 5],
+      ['claude', 3],
       ['anthropic', 2],
       ['minimax', 9],
       ['doubao', 1],
       ['searxng', 2],
       ['exa', 3],
+      ['firecrawl', 3],
     ],
   ),
   ...groupedDebt(
@@ -307,16 +330,13 @@ const TEMPORARY_VENDOR_DEBT: readonly AllowedVendorDebt[] = [
     'Temporary: asset-byte-store selection still switches between concrete storage implementations.',
     [
       ['pg', 12],
-      ['s3', 16],
+      ['s3', 18],
     ],
   ),
   ...groupedDebt(
     'lib/persistence/server-provider.ts',
     'Temporary: server persistence composition still imports concrete storage implementations.',
-    [
-      ['pg', 13],
-      ['s3', 1],
-    ],
+    [['pg', 12]],
   ),
 ] as const;
 
@@ -330,6 +350,7 @@ const GENERIC_ID_PARTS = new Set([
   'image',
   'media',
   'native',
+  'ocr',
   'pdf',
   'plain',
   'search',
@@ -396,6 +417,8 @@ function deriveVendorVocabulary(readSource: (file: string) => string): string[] 
   const terms = new Set<string>();
 
   for (const providerId of providerIds) {
+    // The keyless builtin reader is an implementation category, not a vendor.
+    if (providerId === 'builtin') continue;
     const distinctiveParts = providerId
       .split(/[^a-z0-9]+/u)
       .filter((part) => part.length >= 3 && !GENERIC_ID_PARTS.has(part));

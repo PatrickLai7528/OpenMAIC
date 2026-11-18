@@ -1,21 +1,48 @@
 'use client';
 
+import { normalizeCueUserOptions } from '@/lib/chat/cue-user-options';
+import { useModelCapabilities } from '@/lib/model-settings/use-model-settings';
+import { toast } from 'sonner';
 import {
   forwardRef,
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from 'react';
 import { useStageStore } from '@/lib/store';
 import { PENDING_SCENE_ID } from '@/lib/store/stage';
+import { AnimatePresence, motion } from 'motion/react';
+import { CourseEnd } from '@/components/classroom/course-end/CourseEnd';
+import {
+  readSceneQuizAnswers,
+  summarizeScenes,
+  type CompleteSummary,
+} from '@/lib/classroom/complete-summary';
+import {
+  courseIsComplete,
+  moreIsComing,
+  opensOnNext,
+  opensOnPlaybackEnd,
+  opensOnQuizSubmit,
+  opensWhenBuildEnds,
+  pageAwaitsLearner,
+  waitsForNextPage,
+  type CourseEndAction,
+  type CourseEndContext,
+} from '@/lib/classroom/course-end';
+import { sessionBuildsCourse, useWorkbenchStore } from '@/lib/workbench/session-store';
+import { producerSessionRunning, useRunningSessions } from '@/lib/workbench/running-sessions';
+import { onQuizReviewed } from '@/lib/classroom/quiz-reviewed';
+import { loadQuizAttemptState } from '@/lib/quiz/runtime';
 import { useCanvasStore } from '@/lib/store/canvas';
 import { useSettingsStore } from '@/lib/store/settings';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { SceneSidebar } from '@/components/stage/scene-sidebar';
+import { isTextEntryTarget } from '@/components/stage/page-rail';
 import { Header } from '@/components/header';
 import { CanvasArea } from '@/components/canvas/canvas-area';
 import { Roundtable } from '@/components/roundtable';
@@ -38,6 +65,7 @@ import { ActionEngine } from '@/lib/action/engine';
 import { createAudioPlayer } from '@/lib/utils/audio-player';
 import { useDiscussionTTS } from '@/lib/hooks/use-discussion-tts';
 import { useWidgetIframeStore } from '@/lib/store/widget-iframe';
+import { MEDIA_CONTROL } from '@/lib/interactive/media-bridge';
 import type { AudioIndicatorState } from '@/components/roundtable/audio-indicator';
 import type { Action, DiscussionAction, SpeechAction } from '@/lib/types/action';
 import { cn } from '@/lib/utils';
@@ -56,26 +84,34 @@ import {
 import { AlertTriangle } from 'lucide-react';
 import { VisuallyHidden } from 'radix-ui';
 import type { PPTElement } from '@openmaic/dsl';
-import type { SlideElementReference } from '@/lib/types/chat';
-import { isPiChatEnabled } from '@/lib/config/feature-flags';
+import {
+  getDisplayedWhiteboard,
+  isWhiteboardReferenceAvailable,
+} from '@/lib/whiteboard/element-reference';
+import type { ElementReference } from '@/lib/types/chat';
+import type {
+  PlaybackInteractiveComponentPick,
+  PlaybackInteractivePickerState,
+} from '@/components/scene-renderers/InteractiveIframeHost';
+import { isCoursewareReferenceEnabled } from '@/lib/config/feature-flags';
 import {
   getSlideElementPresentation,
   getSlideElementTypeLabel,
 } from '@/components/canvas/slide-element-pick-overlay';
 import { shouldClearDraftElementReference } from '@/components/chat/element-reference-receipt';
 
-type DraftSlideElementReference = {
-  reference: SlideElementReference;
+/** The pause before the end state, the same as between two pages on autoplay. */
+const COURSE_END_GAP_MS = 1500;
+
+type DraftElementReference = {
+  reference: ElementReference;
   selectionVersion: number;
   sceneOrder?: number;
-  elementType: PPTElement['type'];
+  elementType: PPTElement['type'] | 'interactive';
   displaySummary: string;
 };
 
-type ElementReferenceSendSnapshot = Pick<
-  DraftSlideElementReference,
-  'reference' | 'selectionVersion'
->;
+type ElementReferenceSendSnapshot = Pick<DraftElementReference, 'reference' | 'selectionVersion'>;
 
 /**
  * Imperative handle exposed via `ref` so the parent (`Stage`) can tear
@@ -85,27 +121,38 @@ type ElementReferenceSendSnapshot = Pick<
  * chat to be quiescent — fire-and-forget on unmount loses that guarantee.
  */
 export interface PlaybackChromeRootHandle {
+  pauseForInteractiveMedia: () => void;
   /** Ends any active SSE session, stops the engine, cleans up TTS audio. */
   teardown: () => Promise<void>;
+  /** Receives one identity-only pick from the sibling Interactive iframe host. */
+  acceptInteractivePick: (pick: PlaybackInteractiveComponentPick) => boolean;
+  /** Mirrors iframe Escape into the playback-owned picker state. */
+  cancelElementPick: () => void;
 }
 
 interface PlaybackChromeRootProps {
   readonly onRetryOutline?: (outlineId: string) => Promise<void>;
-  /** Whether the Pro Switch in Header should be enabled. */
+  readonly generationFailureMessage?: string;
+  /** Whether the edit control in Header should be enabled. */
   readonly canEnterProMode?: boolean;
-  /** Pro Switch click handler — parent coordinates teardown + mode flip. */
+  /** Edit control click handler — parent coordinates teardown + mode flip. */
   readonly onEnterProMode?: () => void;
-  readonly proModeActive?: boolean;
-  readonly headerBackControl?: ReactNode;
-  readonly hideHeaderBackControl?: boolean;
+  /**
+   * The workbench is part of this build: the header offers Learn | Edit and,
+   * with `onOpenInWorkspace`, the way into the workspace (see `HeaderControls`).
+   */
+  readonly workbenchControls?: boolean;
+  readonly onOpenInWorkspace?: () => void;
+  /** A visitor's way into their own workbench (see `HeaderControls`). */
+  readonly makeOwnCourseHref?: string;
+  /** The workspace pane draws its own header around a hosted classroom. */
   readonly hideHeader?: boolean;
-  readonly hideHeaderGlobalControls?: boolean;
-  readonly hideHeaderCourseActions?: boolean;
+  readonly onInteractivePickerChange?: (state: PlaybackInteractivePickerState | null) => void;
 }
 
 /**
  * PlaybackChromeRoot — owns the entire playback/autonomous chrome and
- * its state. Mounted whenever `mode !== 'edit'`. The Pro Switch in
+ * its state. Mounted whenever `mode !== 'edit'`. The edit control in
  * `Header` calls `onEnterProMode`; the parent `Stage` is responsible
  * for calling `ref.teardown()` before unmounting this root so SSE and
  * the engine wind down cleanly.
@@ -114,14 +161,14 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
   function PlaybackChromeRoot(
     {
       onRetryOutline,
+      generationFailureMessage,
       canEnterProMode,
       onEnterProMode,
-      proModeActive,
-      headerBackControl,
-      hideHeaderBackControl,
+      workbenchControls,
+      onOpenInWorkspace,
+      makeOwnCourseHref,
       hideHeader,
-      hideHeaderGlobalControls,
-      hideHeaderCourseActions,
+      onInteractivePickerChange,
     },
     ref,
   ) {
@@ -138,20 +185,41 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
     } = useStageStore();
     const failedOutlines = useStageStore.use.failedOutlines();
     const generationComplete = useStageStore.use.generationComplete();
+    const generationInterrupted = useStageStore.use.generationInterrupted();
+    // The workspace's agent run is writing this very course: its pages keep landing.
+    // Either the attached conversation's run (course-specific), or — for a course
+    // open beside a different conversation — any run of the conversation that
+    // produces it (session-level; see `lib/workbench/running-sessions.ts`).
+    const attachedRunBuilding = useWorkbenchStore((s) => sessionBuildsCourse(s, stage?.id));
+    const attachedSessionId = useWorkbenchStore((s) => s.sessionId);
+    const outlineProducerRef = useStageStore((s) => s.outlineProducerRef);
+    const producerBuilding = useRunningSessions((s) =>
+      producerSessionRunning(s.ids, outlineProducerRef, attachedSessionId),
+    );
+    const agentBuilding = attachedRunBuilding || producerBuilding;
 
     const currentScene = getCurrentScene();
-    const piChatEnabled = isPiChatEnabled();
-    const [elementPickActive, setElementPickActive] = useState(false);
+    const coursewareReferenceEnabled = isCoursewareReferenceEnabled();
+    const [elementPickActive, setElementPickActiveState] = useState(false);
+    const elementPickActiveRef = useRef(false);
+    const setElementPickActive = useCallback((next: boolean | ((active: boolean) => boolean)) => {
+      const resolved = typeof next === 'function' ? next(elementPickActiveRef.current) : next;
+      elementPickActiveRef.current = resolved;
+      setElementPickActiveState(resolved);
+    }, []);
     const [draftElementReference, setDraftElementReferenceState] =
-      useState<DraftSlideElementReference | null>(null);
-    const draftElementReferenceRef = useRef<DraftSlideElementReference | null>(null);
+      useState<DraftElementReference | null>(null);
+    const draftElementReferenceRef = useRef<DraftElementReference | null>(null);
     const elementReferenceSceneIdRef = useRef(currentSceneId);
     const selectionVersionRef = useRef(0);
     const pendingInterruptElementReferenceRef = useRef<ElementReferenceSendSnapshot | undefined>(
       undefined,
     );
+    const interactivePickHandlerRef = useRef<(pick: PlaybackInteractiveComponentPick) => boolean>(
+      () => false,
+    );
 
-    const setDraftElementReference = useCallback((next: DraftSlideElementReference | null) => {
+    const setDraftElementReference = useCallback((next: DraftElementReference | null) => {
       draftElementReferenceRef.current = next;
       setDraftElementReferenceState(next);
     }, []);
@@ -186,6 +254,7 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
 
     // Cue user state (Issue 7)
     const [isCueUser, setIsCueUser] = useState(false);
+    const [cueUserOptions, setCueUserOptions] = useState<string[] | undefined>();
 
     // End flash state (Issue 3)
     const [showEndFlash, setShowEndFlash] = useState(false);
@@ -215,12 +284,17 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
 
     // Whiteboard state (from canvas store so AI tools can open it)
     const whiteboardOpen = useCanvasStore.use.whiteboardOpen();
+    const runtimeProjection = useCanvasStore.use.runtimeWhiteboardProjection();
+    const whiteboardClearing = useCanvasStore.use.whiteboardClearing();
+    const { whiteboard: displayedWhiteboard, source: displayedWhiteboardSource } =
+      getDisplayedWhiteboard(stage, runtimeProjection);
     const setWhiteboardOpenManually = useCanvasStore.use.setWhiteboardOpenManually();
 
     // Selected agents from settings store (Zustand)
     const selectedAgentIds = useSettingsStore((s) => s.selectedAgentIds);
     const ttsMuted = useSettingsStore((s) => s.ttsMuted);
-    const ttsEnabled = useSettingsStore((s) => s.ttsEnabled);
+    // Narration is on when the workspace's tts slot resolves to a provider.
+    const ttsEnabled = !!useModelCapabilities().tts;
 
     // Generate participants from selected agents
     const participants = useMemo(
@@ -268,12 +342,18 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
     }, [selectedAgentIds]);
 
     const engineRef = useRef<PlaybackEngine | null>(null);
+    const openCourseEndRef = useRef<(() => Promise<void>) | null>(null);
+    const beginWaitRef = useRef<((sceneId: string, byHand: boolean) => void) | null>(null);
     const audioPlayerRef = useRef(createAudioPlayer());
     const chatAreaRef = useRef<ChatAreaRef>(null);
     const lectureSessionIdRef = useRef<string | null>(null);
     const lectureActionCounterRef = useRef(0);
     const currentPlaybackActionIndexRef = useRef<number | null>(currentPlaybackActionIndex);
     const activeSceneIdRef = useRef<string | null>(currentSceneId);
+    const pauseInteractiveMedia = useCallback(() => {
+      const sceneId = activeSceneIdRef.current;
+      if (sceneId) useWidgetIframeStore.getState().sendMessageByScene[sceneId]?.(MEDIA_CONTROL, {});
+    }, []);
     const discussionAbortRef = useRef<AbortController | null>(null);
     const presentationIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const cursorSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -415,6 +495,7 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
       setSpeechProgress(null);
       setThinkingState(null);
       setIsCueUser(false);
+      setCueUserOptions(undefined);
       setIsTopicPending(false);
       setChatIsStreaming(false);
       setChatIsSoftClosing(false);
@@ -551,8 +632,17 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
           discussionTTS.cleanup();
           resetSceneState();
         },
+        pauseForInteractiveMedia: () => {
+          const engine = engineRef.current;
+          if (engine?.getMode() !== 'playing') return;
+          engine.pause();
+          if (lectureSessionIdRef.current)
+            chatAreaRef.current?.pauseBuffer(lectureSessionIdRef.current);
+        },
+        acceptInteractivePick: (pick) => interactivePickHandlerRef.current(pick),
+        cancelElementPick: () => setElementPickActive(false),
       }),
-      [discussionTTS, resetSceneState],
+      [discussionTTS, resetSceneState, setElementPickActive],
     );
 
     const clearPresentationIdleTimer = useCallback(() => {
@@ -655,6 +745,10 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
     useEffect(() => {
       let cancelled = false;
       const initializeScene = async () => {
+        const previousEngine = engineRef.current;
+        engineRef.current = null;
+        previousEngine?.stop();
+
         const previousSceneId = activeSceneIdRef.current;
         if (previousSceneId && previousSceneId !== currentScene?.id) {
           saveSceneResumePosition(previousSceneId, currentPlaybackActionIndexRef.current);
@@ -726,16 +820,10 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
           !!currentScene?.actions &&
           (currentScene.actions.length > 0 || currentScene.type === 'slide');
         if (!currentScene || !hasPlayableActions) {
-          engineRef.current = null;
           setEngineMode('idle');
           activeSceneIdRef.current = currentSceneId;
 
           return;
-        }
-
-        // Stop previous engine
-        if (engineRef.current) {
-          engineRef.current.stop();
         }
 
         // Widget iframe messaging callback for interactive scenes, resolved lazily
@@ -757,6 +845,7 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
 
         // Create new PlaybackEngine
         const engine = new PlaybackEngine([currentScene], actionEngine, audioPlayerRef.current, {
+          beforeSpeech: pauseInteractiveMedia,
           onModeChange: (mode) => {
             setEngineMode(mode);
           },
@@ -764,7 +853,7 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
             // Identity guard: a superseded engine (scene switch during an
             // async resume) must not publish its old scene's position over
             // the installed engine's cursor.
-            if (engineRef.current !== null && engineRef.current !== engine) return;
+            if (engineRef.current !== engine) return;
             updateCurrentPlaybackActionIndex(snapshot.actionIndex);
             saveSceneResumePosition(snapshot.sceneId, snapshot.actionIndex);
             if (playbackStageId && snapshot.sceneId) {
@@ -919,6 +1008,18 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
                 }
               }, 1500);
             }
+            // The last page finished: the course's end, autoplay or not.
+            const finishedSceneId = currentScene.id;
+            const finishedType = currentScene.type;
+            window.setTimeout(() => {
+              if (useStageStore.getState().currentSceneId !== finishedSceneId) return;
+              if (opensOnPlaybackEnd(courseEndContextRef.current, finishedType)) {
+                void openCourseEndRef.current?.();
+              } else if (!pageAwaitsLearner(finishedType)) {
+                // More is being built: wait here for it, not at an end that isn't one.
+                beginWaitRef.current?.(finishedSceneId, false);
+              }
+            }, COURSE_END_GAP_MS);
           },
         });
 
@@ -929,11 +1030,17 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
         if (autoStartRef.current) {
           autoStartRef.current = false;
           (async () => {
-            if (currentScene && chatAreaRef.current) {
-              const sessionId = await chatAreaRef.current.startLecture(currentScene.id);
+            const chatArea = chatAreaRef.current;
+            if (currentScene && chatArea) {
+              const sessionId = await chatArea.startLecture(currentScene.id);
+              if (engineRef.current !== engine) {
+                await chatArea.endSession(sessionId);
+                return;
+              }
               lectureSessionIdRef.current = sessionId;
               lectureActionCounterRef.current = 0;
             }
+            if (engineRef.current !== engine) return;
             engine.start();
           })();
         } else {
@@ -1005,7 +1112,7 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
     }, [playbackSpeed]);
 
     /**
-     * Handle discussion SSE — POST /api/chat and push events to engine
+     * Start a discussion in ChatArea, which sends it through the classroom chat hook
      */
     const handleDiscussionSSE = useCallback(
       async (topic: string, prompt?: string, agentId?: string) => {
@@ -1146,10 +1253,16 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
         const wasCompleted = playbackCompleted;
         setPlaybackCompleted(false);
         // Starting playback - create/reuse lecture session
-        if (currentScene && chatAreaRef.current) {
-          const sessionId = await chatAreaRef.current.startLecture(currentScene.id);
+        const chatArea = chatAreaRef.current;
+        if (currentScene && chatArea) {
+          const sessionId = await chatArea.startLecture(currentScene.id);
+          if (engineRef.current !== engine) {
+            await chatArea.endSession(sessionId);
+            return;
+          }
           lectureSessionIdRef.current = sessionId;
         }
+        if (engineRef.current !== engine) return;
         if (wasCompleted) {
           // Restart from beginning (user clicked restart after completion)
           lectureActionCounterRef.current = 0;
@@ -1164,18 +1277,125 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
     // get scene information
     const isPendingScene = currentSceneId === PENDING_SCENE_ID;
     const hasNextPending = generatingOutlines.length > 0;
-    // True when every outline has materialized into a scene and nothing is
-    // currently generating — signals the classroom has finished and the user
-    // can see a completion page. Comparing scenes.length === outlines.length
-    // (rather than just `scenes.length > 0`) means a partial generation with
-    // some failed outlines does not falsely trigger completion. The persisted
-    // generationComplete flag also marks completion directly, so an edited
-    // finished deck (e.g. a deleted slide, leaving outlines.length > scenes)
-    // still reads as complete.
-    const isCourseComplete =
-      generationComplete ||
-      (outlines.length > 0 && scenes.length === outlines.length && generatingOutlines.length === 0);
-    const canAdvanceToPendingSlot = hasNextPending || isCourseComplete;
+    // Complete once every outline has its scene, or the persisted flag says so
+    // (an edited finished deck can have fewer scenes than outlines) — but never
+    // while a generation run or the workspace's agent is still building it: an
+    // agent grows the outline page by page, so between two pages it only looks
+    // complete. See `courseIsComplete`.
+    const courseBuild = {
+      generationComplete,
+      outlineCount: outlines.length,
+      sceneCount: scenes.length,
+      generatingCount: generatingOutlines.length,
+      agentBuilding,
+    };
+    const moreComing = moreIsComing(courseBuild);
+    // The end state: a layer over the last page, with its own way in from next.
+    const nextOpensEnd = courseIsComplete(courseBuild);
+    const [courseEnd, setCourseEnd] = useState<CompleteSummary | null>(null);
+    const courseEndFiredRef = useRef(false);
+    const courseEndTokenRef = useRef(0);
+    const lastScene = scenes.at(-1);
+
+    const openCourseEnd = useCallback(async () => {
+      courseEndFiredRef.current = true;
+      const token = ++courseEndTokenRef.current;
+      const deck = useStageStore.getState().scenes;
+      const summary = await summarizeScenes(deck, (sceneId) =>
+        readSceneQuizAnswers(
+          deck.find((scene) => scene.id === sceneId),
+          loadQuizAttemptState,
+        ),
+      );
+      if (token === courseEndTokenRef.current) setCourseEnd(summary);
+    }, []);
+    const closeCourseEnd = useCallback(() => {
+      courseEndTokenRef.current += 1;
+      setCourseEnd(null);
+    }, []);
+
+    // It belongs to the last page: leaving that page, however, closes it.
+    useEffect(() => {
+      closeCourseEnd();
+    }, [currentSceneId, closeCourseEnd]);
+
+    // What the delayed triggers need to know when they fire, not when they were set.
+    const courseEndContextRef = useRef<CourseEndContext>({
+      courseComplete: false,
+      onLastPage: false,
+      busy: false,
+      fired: false,
+    });
+    courseEndContextRef.current = {
+      courseComplete: nextOpensEnd,
+      onLastPage: !!lastScene && lastScene.id === currentSceneId,
+      busy: isTopicActive || chatIsStreaming || engineMode === 'live',
+      fired: courseEndFiredRef.current,
+    };
+    openCourseEndRef.current = openCourseEnd;
+
+    // At the last page while more is being built: the learner waits here for the
+    // next page, told it is coming, and moves on to it when it lands.
+    const [waitingPast, setWaitingPast] = useState<{
+      readonly sceneId: string;
+      /** Begun by pressing next, rather than by the page ending. */
+      readonly byHand: boolean;
+    } | null>(null);
+    const waitContextRef = useRef({ moreComing, onLastPage: false, pendingPage: hasNextPending });
+    waitContextRef.current = {
+      moreComing,
+      onLastPage: courseEndContextRef.current.onLastPage,
+      pendingPage: hasNextPending,
+    };
+    const beginWait = useCallback((sceneId: string, byHand: boolean) => {
+      if (courseEndContextRef.current.busy) return;
+      if (!waitsForNextPage(waitContextRef.current)) return;
+      setWaitingPast({ sceneId, byHand });
+    }, []);
+    beginWaitRef.current = beginWait;
+
+    useEffect(() => {
+      if (!waitingPast) return;
+      const index = scenes.findIndex((scene) => scene.id === waitingPast.sceneId);
+      const next = index >= 0 ? scenes[index + 1] : undefined;
+      if (waitingPast.sceneId !== currentSceneId) {
+        setWaitingPast(null);
+      } else if (next) {
+        // The next page landed: go on to it, playing on if playback was.
+        setWaitingPast(null);
+        const autoplay = useSettingsStore.getState().autoPlayLecture;
+        if (waitingPast.byHand || autoplay) {
+          if (autoplay && !waitingPast.byHand) autoStartRef.current = true;
+          setCurrentSceneId(next.id);
+        }
+      } else if (!moreComing) {
+        // The build ended with this page last: it was the end after all.
+        setWaitingPast(null);
+        if (opensWhenBuildEnds(courseEndContextRef.current, waitingPast.byHand)) {
+          void openCourseEnd();
+        }
+      }
+    }, [currentSceneId, moreComing, openCourseEnd, scenes, setCurrentSceneId, waitingPast]);
+
+    // A quiz on the last page opens it once handed in: it is what the page was waiting for.
+    useEffect(
+      () =>
+        onQuizReviewed(() => {
+          window.setTimeout(() => {
+            if (opensOnQuizSubmit(courseEndContextRef.current)) void openCourseEnd();
+            else {
+              const sceneId = useStageStore.getState().currentSceneId;
+              if (sceneId) beginWaitRef.current?.(sceneId, false);
+            }
+          }, COURSE_END_GAP_MS);
+        }),
+      [openCourseEnd],
+    );
+
+    // A completed course has nothing pending: don't wait on the slot for what cannot come.
+    useEffect(() => {
+      if (isPendingScene && nextOpensEnd && lastScene) setCurrentSceneId(lastScene.id);
+    }, [isPendingScene, lastScene, nextOpensEnd, setCurrentSceneId]);
 
     // previous scene (gated)
     const handlePreviousScene = useCallback(() => {
@@ -1198,27 +1418,165 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
       const currentIndex = scenes.findIndex((s) => s.id === currentSceneId);
       if (currentIndex < scenes.length - 1) {
         void gatedSceneSwitch(scenes[currentIndex + 1].id);
-      } else if (canAdvanceToPendingSlot) {
-        // On last real scene → advance to pending slot (generating or completion page)
+      } else if (hasNextPending) {
+        // On last real scene → advance to the page still being generated
         void gatedSceneSwitch(PENDING_SCENE_ID);
+      } else if (opensOnNext(courseEndContextRef.current)) {
+        if (engineRef.current && engineMode === 'playing') engineRef.current.pause();
+        void openCourseEnd();
+      } else if (currentSceneId) {
+        beginWait(currentSceneId, true);
       }
-    }, [currentSceneId, gatedSceneSwitch, canAdvanceToPendingSlot, isPendingScene, scenes]);
+    }, [
+      beginWait,
+      currentSceneId,
+      engineMode,
+      gatedSceneSwitch,
+      hasNextPending,
+      isPendingScene,
+      openCourseEnd,
+      scenes,
+    ]);
+
+    const handleCourseEndAction = useCallback(
+      (action: CourseEndAction) => {
+        const target =
+          action === 'reviewWrong'
+            ? courseEnd?.firstWrongQuizId
+            : action === 'doQuiz'
+              ? courseEnd?.unattemptedQuizIds[0]
+              : scenes[0]?.id;
+        closeCourseEnd();
+        if (!target) return;
+        if (action !== 'restart') {
+          void gatedSceneSwitch(target);
+          return;
+        }
+        // A new playthrough, from the first word.
+        courseEndFiredRef.current = false;
+        clearSceneResumePosition(target);
+        if (target === currentSceneId) {
+          void handlePlayPause();
+          return;
+        }
+        autoStartRef.current = true;
+        void gatedSceneSwitch(target);
+      },
+      [
+        clearSceneResumePosition,
+        closeCourseEnd,
+        courseEnd,
+        currentSceneId,
+        gatedSceneSwitch,
+        handlePlayPause,
+        scenes,
+      ],
+    );
 
     const currentSceneIndex = isPendingScene
       ? scenes.length
       : scenes.findIndex((s) => s.id === currentSceneId);
-    const totalScenesCount = scenes.length + (canAdvanceToPendingSlot ? 1 : 0);
-    const showElementReference = piChatEnabled && mode === 'playback';
+    const totalScenesCount = scenes.length + (hasNextPending ? 1 : 0);
+    const showElementReference = coursewareReferenceEnabled && mode === 'playback';
     const canPickSlideElement = Boolean(
       showElementReference &&
       !whiteboardOpen &&
       currentScene?.type === 'slide' &&
       currentScene.content.type === 'slide',
     );
+    const isHtmlBackedInteractiveScene = Boolean(
+      currentScene?.type === 'interactive' &&
+      currentScene.content.type === 'interactive' &&
+      typeof currentScene.content.html === 'string' &&
+      currentScene.content.html.trim().length > 0,
+    );
+    const canPickInteractiveComponent = Boolean(
+      showElementReference && !whiteboardOpen && isHtmlBackedInteractiveScene,
+    );
+    const canPickWhiteboardElement = Boolean(
+      showElementReference &&
+      whiteboardOpen &&
+      !whiteboardClearing &&
+      displayedWhiteboardSource === 'stage_snapshot' &&
+      displayedWhiteboard?.elements.length,
+    );
+    const canPickElement =
+      canPickSlideElement || canPickInteractiveComponent || canPickWhiteboardElement;
+
+    const handlePickWhiteboardElement = useCallback(
+      (element: PPTElement) => {
+        if (!elementPickActiveRef.current || !canPickWhiteboardElement || !stage) return;
+        if (
+          !displayedWhiteboard ||
+          displayedWhiteboard.elements.filter((item) => item.id === element.id).length !== 1
+        )
+          return;
+        setElementPickActive(false);
+        const selectionVersion = ++selectionVersionRef.current;
+        setDraftElementReference({
+          reference: {
+            kind: 'whiteboard_element',
+            whiteboardId: displayedWhiteboard.id,
+            elementId: element.id,
+          },
+          selectionVersion,
+          elementType: element.type,
+          displaySummary: getSlideElementPresentation(element, t).displaySummary,
+        });
+      },
+      [
+        canPickWhiteboardElement,
+        stage,
+        displayedWhiteboard,
+        setElementPickActive,
+        setDraftElementReference,
+        t,
+      ],
+    );
+
+    const canSendReferencedMessage = useCallback(() => {
+      const reference = draftElementReferenceRef.current?.reference;
+      if (reference?.kind !== 'whiteboard_element') return true;
+      const canvas = useCanvasStore.getState();
+      if (
+        !canvas.whiteboardClearing &&
+        isWhiteboardReferenceAvailable(
+          reference,
+          useStageStore.getState().stage,
+          canvas.runtimeWhiteboardProjection,
+        )
+      )
+        return true;
+      toast.info(t('chat.elementReference.whiteboardChanged'));
+      return false;
+    }, [t]);
+
+    useEffect(() => {
+      if (!elementPickActive || !canPickInteractiveComponent) return;
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (event.key !== 'Escape') return;
+        event.preventDefault();
+        event.stopPropagation();
+        setElementPickActive(false);
+      };
+      // An event focused inside the sandboxed iframe is handled by its picker
+      // shim. This listener covers the same Escape affordance while focus is
+      // still in playback chrome after the reference button arms the iframe.
+      window.addEventListener('keydown', onKeyDown, true);
+      return () => window.removeEventListener('keydown', onKeyDown, true);
+    }, [canPickInteractiveComponent, elementPickActive, setElementPickActive]);
 
     const handlePickElement = useCallback(
       (element: PPTElement) => {
-        if (currentScene?.type !== 'slide' || currentScene.content.type !== 'slide') return;
+        if (
+          !elementPickActiveRef.current ||
+          !showElementReference ||
+          currentScene?.type !== 'slide' ||
+          currentScene.content.type !== 'slide'
+        ) {
+          return;
+        }
+        setElementPickActive(false);
         const selectionVersion = selectionVersionRef.current + 1;
         selectionVersionRef.current = selectionVersion;
         const { displaySummary } = getSlideElementPresentation(element, t);
@@ -1233,24 +1591,130 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
           elementType: element.type,
           displaySummary,
         });
-        setElementPickActive(false);
       },
-      [currentScene, currentSceneIndex, setDraftElementReference, t],
+      [
+        currentScene,
+        currentSceneIndex,
+        setDraftElementReference,
+        setElementPickActive,
+        showElementReference,
+        t,
+      ],
     );
 
+    const handlePickInteractiveComponent = useCallback(
+      (pick: PlaybackInteractiveComponentPick): boolean => {
+        if (
+          !elementPickActiveRef.current ||
+          !canPickInteractiveComponent ||
+          currentScene?.type !== 'interactive' ||
+          currentScene.content.type !== 'interactive' ||
+          pick.sceneId !== currentScene.id
+        ) {
+          return false;
+        }
+        // Consume the owner-owned arm synchronously. The iframe host is a sibling
+        // projection and may still deliver a message from its previous render
+        // before React publishes the inactive state back to it.
+        setElementPickActive(false);
+        const selectionVersion = selectionVersionRef.current + 1;
+        selectionVersionRef.current = selectionVersion;
+        setDraftElementReference({
+          reference: {
+            kind: 'interactive_component',
+            sceneId: currentScene.id,
+            selector: pick.selector,
+          },
+          selectionVersion,
+          sceneOrder: currentSceneIndex >= 0 ? currentSceneIndex : currentScene.order,
+          elementType: 'interactive',
+          displaySummary: pick.selector,
+        });
+        return true;
+      },
+      [
+        canPickInteractiveComponent,
+        currentScene,
+        currentSceneIndex,
+        setDraftElementReference,
+        setElementPickActive,
+      ],
+    );
+    interactivePickHandlerRef.current = handlePickInteractiveComponent;
+
+    // Declaring a state interface adds evidence to a reference; it never replaces
+    // the component picker with a whole-area reference.
     const handleToggleElementPick = useCallback(() => {
-      if (!canPickSlideElement) return;
+      if (!canPickElement) return;
       setElementPickActive((active) => !active);
-    }, [canPickSlideElement]);
+    }, [canPickElement, setElementPickActive]);
 
     useEffect(() => {
-      if (whiteboardOpen || !canPickSlideElement) setElementPickActive(false);
-    }, [canPickSlideElement, whiteboardOpen]);
+      if (!canPickElement) setElementPickActive(false);
+    }, [canPickElement, setElementPickActive, whiteboardOpen]);
+
+    // An armed picker belongs to the surface it was armed on. Opening or closing
+    // the whiteboard (student toggle, Teacher action, or runtime visibility) ends
+    // it instead of moving it to the other surface; a selected draft is kept.
+    // Layout timing keeps the destination picker from painting for a frame.
+    const previousWhiteboardOpenRef = useRef(whiteboardOpen);
+    useLayoutEffect(() => {
+      if (previousWhiteboardOpenRef.current === whiteboardOpen) return;
+      previousWhiteboardOpenRef.current = whiteboardOpen;
+      setElementPickActive(false);
+    }, [setElementPickActive, whiteboardOpen]);
+
+    useEffect(() => {
+      if (showElementReference) return;
+      setElementPickActive(false);
+      setDraftElementReference(null);
+    }, [setDraftElementReference, setElementPickActive, showElementReference]);
+
+    useEffect(() => {
+      if (!onInteractivePickerChange) return;
+      if (
+        showElementReference &&
+        isHtmlBackedInteractiveScene &&
+        currentScene?.type === 'interactive'
+      ) {
+        const selectedSelector =
+          draftElementReference?.reference.kind === 'interactive_component' &&
+          draftElementReference.reference.sceneId === currentScene.id
+            ? draftElementReference.reference.selector
+            : undefined;
+        onInteractivePickerChange({
+          sceneId: currentScene.id,
+          active: canPickInteractiveComponent && elementPickActive,
+          selectedSelector,
+        });
+      } else {
+        onInteractivePickerChange(null);
+      }
+    }, [
+      canPickInteractiveComponent,
+      currentScene,
+      draftElementReference,
+      elementPickActive,
+      isHtmlBackedInteractiveScene,
+      onInteractivePickerChange,
+      showElementReference,
+    ]);
+
+    useEffect(
+      () => () => {
+        onInteractivePickerChange?.(null);
+      },
+      [onInteractivePickerChange],
+    );
 
     useEffect(() => {
       const previousSceneId = elementReferenceSceneIdRef.current;
       elementReferenceSceneIdRef.current = currentSceneId;
-      if (previousSceneId === currentSceneId) return;
+      if (
+        previousSceneId === currentSceneId ||
+        draftElementReferenceRef.current?.reference.kind === 'whiteboard_element'
+      )
+        return;
       setDraftElementReference(null);
     }, [currentSceneId, setDraftElementReference]);
 
@@ -1287,33 +1751,15 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
 
     // whiteboard toggle
     const handleWhiteboardToggle = () => {
-      if (!whiteboardOpen) setElementPickActive(false);
       setWhiteboardOpenManually(!whiteboardOpen);
     };
-
-    const isPresentationShortcutTarget = useCallback((target: EventTarget | null) => {
-      if (!(target instanceof HTMLElement)) return false;
-
-      if (target.isContentEditable || target.closest('[contenteditable="true"]')) {
-        return true;
-      }
-
-      return (
-        target.closest(
-          ['input', 'textarea', 'select', '[role="slider"]', 'input[type="range"]'].join(', '),
-        ) !== null
-      );
-    }, []);
 
     useEffect(() => {
       const onKeyDown = (event: KeyboardEvent) => {
         if (event.defaultPrevented) return;
         // Let modifier-key combos (Ctrl+C, Ctrl+S, etc.) pass through to the browser
         if (event.ctrlKey || event.metaKey || event.altKey) return;
-        if (
-          isPresentationShortcutTarget(event.target) ||
-          isPresentationShortcutTarget(document.activeElement)
-        ) {
+        if (isTextEntryTarget(event.target) || isTextEntryTarget(document.activeElement)) {
           return;
         }
 
@@ -1360,11 +1806,6 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
             event.preventDefault();
             setTTSMuted(!ttsMuted);
             break;
-          case 's':
-          case 'S':
-            event.preventDefault();
-            setSidebarCollapsed(!sidebarCollapsed);
-            break;
           case 'c':
           case 'C':
             event.preventDefault();
@@ -1385,13 +1826,10 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
       handlePreviousScene,
       isPresenting,
       isPresentationInteractionActive,
-      isPresentationShortcutTarget,
       resetPresentationIdleTimer,
       setChatAreaCollapsed,
-      setSidebarCollapsed,
       setTTSMuted,
       setTTSVolume,
-      sidebarCollapsed,
       togglePresentation,
       ttsMuted,
       ttsVolume,
@@ -1435,19 +1873,10 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
         }
       : null;
 
-    // Scene viewer height — header is 80px when visible, roundtable is
-    // 192px in playback mode (autonomous hides it). Mode is guaranteed
-    // non-'edit' here since the parent Stage unmounts this component
-    // when entering Pro mode.
-    const sceneViewerHeight = (() => {
-      const headerHeight = isPresenting || hideHeader ? 0 : 80;
-      const roundtableHeight = mode === 'playback' && !isPresenting ? 192 : 0;
-      return `calc(100% - ${headerHeight + roundtableHeight}px)`;
-    })();
-
     return (
       <div
         ref={stageRef}
+        data-playback-stage=""
         className={cn(
           'flex-1 flex overflow-hidden bg-gray-50 dark:bg-gray-900',
           isPresenting && !controlsVisible && 'cursor-none',
@@ -1458,41 +1887,29 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
           onCollapseChange={setSidebarCollapsed}
           onSceneSelect={gatedSceneSwitch}
           onRetryOutline={onRetryOutline}
-          isCourseComplete={isCourseComplete}
         />
 
         {/* Main Content Area */}
         <div className="flex-1 flex flex-col overflow-hidden min-w-0 relative">
-          {/* Header — playback only. The Pro Switch fires `onEnterProMode`
+          {/* Header — playback only. The edit control fires `onEnterProMode`
             (passed by the parent Stage) which awaits our `teardown()`
             before the parent flips mode to 'edit'. */}
           {!isPresenting && !hideHeader && (
             <Header
-              currentSceneTitle={
-                currentScene?.title ||
-                (isCourseComplete && isPendingScene ? t('stage.courseComplete') : '')
-              }
+              currentSceneTitle={currentScene?.title || ''}
               mode={mode}
-              proModeActive={proModeActive}
               canEdit={!!canEnterProMode}
               onToggleEditMode={onEnterProMode}
-              backControl={headerBackControl}
-              hideBackControl={hideHeaderBackControl}
-              hideGlobalControls={hideHeaderGlobalControls}
-              hideCourseActions={hideHeaderCourseActions}
+              workbenchControls={workbenchControls}
+              onOpenInWorkspace={onOpenInWorkspace}
+              makeOwnCourseHref={makeOwnCourseHref}
             />
           )}
 
           {/* Canvas Area — playback-only renderer. The parent Stage swaps
             this whole PlaybackChromeRoot out when entering edit mode, so
             no inline branching is needed here. */}
-          <div
-            className="overflow-hidden relative flex-1 min-h-0 isolate"
-            style={{
-              height: sceneViewerHeight,
-            }}
-            suppressHydrationWarning
-          >
+          <div className="overflow-hidden relative flex-1 min-h-0 isolate" suppressHydrationWarning>
             <CanvasArea
               currentScene={currentScene}
               currentSceneIndex={currentSceneIndex}
@@ -1527,23 +1944,50 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
               onStopDiscussion={handleStopDiscussion}
               onContinueDiscussion={handleContinueDiscussion}
               showElementReference={showElementReference}
-              canPickSlideElement={canPickSlideElement}
+              canPickSlideElement={canPickElement}
               elementPickActive={elementPickActive}
               onToggleElementPick={handleToggleElementPick}
               onPickElement={handlePickElement}
+              whiteboardElementReference={
+                showElementReference &&
+                draftElementReference?.reference.kind === 'whiteboard_element'
+                  ? draftElementReference.reference
+                  : undefined
+              }
+              onPickWhiteboardElement={handlePickWhiteboardElement}
               onCancelElementPick={() => setElementPickActive(false)}
               hideToolbar={mode === 'playback' || (isPresenting && !controlsVisible)}
               isPendingScene={isPendingScene}
-              isCourseComplete={isCourseComplete}
               isGenerationFailed={
                 isPendingScene && failedOutlines.some((f) => f.id === generatingOutlines[0]?.id)
               }
+              isGenerationInterrupted={isPendingScene && generationInterrupted}
+              generationFailureMessage={generationFailureMessage}
               onRetryGeneration={
                 onRetryOutline && generatingOutlines[0]
                   ? () => onRetryOutline(generatingOutlines[0].id)
                   : undefined
               }
             />
+            <AnimatePresence>
+              {courseEnd && !isPendingScene ? (
+                <motion.div
+                  key="course-end"
+                  className="absolute inset-0 z-[130]"
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.18 }}
+                >
+                  <CourseEnd
+                    summary={courseEnd}
+                    courseName={stage?.name ?? ''}
+                    pageCount={scenes.length}
+                    blurBehind={currentScene?.type !== 'interactive'}
+                    onDismiss={closeCourseEnd}
+                    onAction={handleCourseEndAction}
+                  />
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
           </div>
 
           {/* Roundtable Area */}
@@ -1556,6 +2000,11 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
               )}
             >
               <Roundtable
+                nextOpensEnd={nextOpensEnd}
+                foldDock={
+                  Boolean(courseEnd) && !lectureSpeech && (playbackCompleted || !firstSpeechText)
+                }
+                courseEndOpen={Boolean(courseEnd) && !isPendingScene}
                 mode={mode}
                 initialParticipants={participants}
                 playbackView={playbackView}
@@ -1581,11 +2030,13 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
                 endFlashSessionType={endFlashSessionType}
                 thinkingState={thinkingState}
                 isCueUser={isCueUser}
+                cueUserOptions={cueUserOptions}
                 isSoftClosing={chatIsSoftClosing}
                 softCloseDeadline={softCloseDeadline}
                 isTopicPending={isTopicPending}
+                canSendMessage={canSendReferencedMessage}
                 onMessageSend={async (msg) => {
-                  const draft = draftElementReferenceRef.current;
+                  const draft = showElementReference ? draftElementReferenceRef.current : null;
                   const elementReferenceSnapshot: ElementReferenceSendSnapshot | undefined = draft
                     ? {
                         reference: draft.reference,
@@ -1632,6 +2083,7 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
                   // Auto-switch to chat tab when user sends a message
                   chatAreaRef.current?.switchToTab('chat');
                   setIsCueUser(false);
+                  setCueUserOptions(undefined);
                   // Immediately mark streaming for synchronized stop button
                   setChatIsStreaming(true);
                   setChatSessionType(chatSessionType || 'qa');
@@ -1703,16 +2155,22 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
                 onPresentationInteractionChange={setIsPresentationInteractionActive}
                 fullscreenContainerRef={stageRef}
                 showElementReference={showElementReference}
-                canPickSlideElement={canPickSlideElement}
+                canPickSlideElement={canPickElement}
                 elementPickActive={elementPickActive}
                 onToggleElementPick={handleToggleElementPick}
                 elementReferencePill={
                   draftElementReference
                     ? {
-                        sceneLabel: t('chat.lectureNotes.pageLabel', {
-                          n: (draftElementReference.sceneOrder ?? 0) + 1,
-                        }),
-                        elementType: getSlideElementTypeLabel(draftElementReference.elementType, t),
+                        sceneLabel:
+                          draftElementReference.reference.kind === 'whiteboard_element'
+                            ? t('whiteboard.title')
+                            : t('chat.lectureNotes.pageLabel', {
+                                n: (draftElementReference.sceneOrder ?? 0) + 1,
+                              }),
+                        elementType:
+                          draftElementReference.elementType === 'interactive'
+                            ? t('edit.sceneType.interactive')
+                            : getSlideElementTypeLabel(draftElementReference.elementType, t),
                         displaySummary: draftElementReference.displaySummary,
                       }
                     : undefined
@@ -1777,7 +2235,8 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
                 setThinkingState(state);
               });
             }}
-            onCueUser={(_fromAgentId, _prompt) => {
+            onCueUser={(_fromAgentId, _prompt, options) => {
+              setCueUserOptions(normalizeCueUserOptions(options));
               setIsCueUser(true);
             }}
             onLiveSessionError={handleLiveSessionError}
@@ -1785,6 +2244,7 @@ export const PlaybackChromeRoot = forwardRef<PlaybackChromeRootHandle, PlaybackC
               setThinkingState(null);
               setSpeechProgress(null);
               setIsCueUser(false);
+              setCueUserOptions(undefined);
               setActiveBubbleId(null);
             }}
             onSoftClosingChange={(softClosing, deadline) => {

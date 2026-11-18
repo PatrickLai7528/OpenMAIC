@@ -8,7 +8,9 @@
  */
 import { randomUUID } from 'node:crypto';
 
-import { splitSqlStatements } from '../document/pg.js';
+import { applySchemaMigrations, type SchemaMigrationSet } from '../pg-migrations.js';
+import { encodeJson } from '../pg-json.js';
+import { sanitizePgText } from '../pg-text.js';
 import type { Queryable, WithTransaction } from '../runtime/pg.js';
 import {
   AGENT_SESSION_LIFECYCLE,
@@ -24,6 +26,7 @@ import {
   type AgentSessionMeta,
   type AgentSessionAutomaticTitleStore,
   type AgentSessionStore,
+  type AgentSessionSkillStore,
   type AgentSessionTitleStore,
   type AgentSessionTransaction,
   type AgentSessionUrlSource,
@@ -86,8 +89,8 @@ export interface PgAgentSessionStoreOptions extends AgentSessionHooks {
   now?: () => number;
 }
 
-/** Pinned default schema for the PostgreSQL agent-session backend. */
-export const AGENT_SESSION_PG_SCHEMA = `
+/** Baseline (version 1) of the agent-session schema, for the default table names. */
+const AGENT_SESSION_PG_BASELINE = `
 CREATE TABLE IF NOT EXISTS agent_sessions (
   id                  TEXT PRIMARY KEY,
   owner_id            TEXT NOT NULL,
@@ -223,6 +226,25 @@ CREATE TABLE IF NOT EXISTS agent_owner_session_events (
     CHECK (attempt IS NULL OR attempt >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS agent_session_urls (
+  session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+  url        TEXT NOT NULL,
+  source     TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (session_id, url),
+  CONSTRAINT agent_session_urls_source_known CHECK (source IN ('user','web_search'))
+);
+
+CREATE INDEX IF NOT EXISTS agent_session_urls_session_created_idx
+  ON agent_session_urls (session_id, created_at);
+`;
+
+/**
+ * Version 2: replace the closed owner-event type constraint of databases
+ * created before `session_title` events with its superset. A one-time step: it
+ * drops the old constraint.
+ */
+const AGENT_SESSION_PG_OWNER_EVENT_TYPE_V2 = `
 DO $agent_session_owner_event_type_constraint$
 BEGIN
   IF EXISTS (
@@ -275,19 +297,73 @@ BEGIN
   END IF;
 END
 $agent_session_owner_event_type_validation$;
-
-CREATE TABLE IF NOT EXISTS agent_session_urls (
-  session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
-  url        TEXT NOT NULL,
-  source     TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (session_id, url),
-  CONSTRAINT agent_session_urls_source_known CHECK (source IN ('user','web_search'))
-);
-
-CREATE INDEX IF NOT EXISTS agent_session_urls_session_created_idx
-  ON agent_session_urls (session_id, created_at);
 `;
+
+/**
+ * Version 4: the event seq of the session's unanswered `user_question`, kept
+ * on the session row so the owner list can say "waiting for your answer"
+ * without reading any event log. Maintained by every event append (see
+ * `insertEvent`); this backfill derives it once from the existing logs with the
+ * same rule `postUserMessage` uses for an outstanding ask: the newest question
+ * that no later non-blank user message follows.
+ */
+const AGENT_SESSION_PG_OPEN_QUESTION_V4 = `
+ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS open_question_seq INTEGER;
+
+UPDATE agent_sessions s
+SET open_question_seq = pending.seq
+FROM (
+  SELECT question.session_id, max(question.seq) AS seq
+  FROM agent_session_events question
+  WHERE question.type = 'user_question'
+    AND NOT EXISTS (
+      SELECT 1 FROM agent_session_events answer
+      WHERE answer.session_id = question.session_id
+        AND answer.seq > question.seq
+        AND answer.type = 'user_message'
+        AND length(btrim(COALESCE(answer.data->>'text', ''))) > 0
+    )
+  GROUP BY question.session_id
+) pending
+WHERE s.id = pending.session_id AND s.open_question_seq IS NULL;
+`;
+
+/**
+ * The agent-session backend's migrations, for the default table names
+ * (recorded under the store `agent-session`). Both run outside a transaction:
+ * each constraint install must release its ACCESS EXCLUSIVE lock before the
+ * validation that follows scans existing rows, and every statement is guarded,
+ * so a run interrupted part-way is simply repeated.
+ */
+export const AGENT_SESSION_PG_MIGRATIONS: SchemaMigrationSet = {
+  store: 'agent-session',
+  migrations: [
+    { version: 1, name: 'baseline', up: AGENT_SESSION_PG_BASELINE, transaction: false },
+    {
+      version: 2,
+      name: 'owner_event_type_known_v2',
+      up: AGENT_SESSION_PG_OWNER_EVENT_TYPE_V2,
+      transaction: false,
+    },
+    {
+      version: 3,
+      name: 'locale',
+      up: `ALTER TABLE agent_sessions ADD COLUMN IF NOT EXISTS locale TEXT;`,
+      transaction: true,
+    },
+    {
+      version: 4,
+      name: 'open_question_seq',
+      up: AGENT_SESSION_PG_OPEN_QUESTION_V4,
+      transaction: true,
+    },
+  ],
+};
+
+/** Pinned default schema for the PostgreSQL agent-session backend: every migration's SQL. */
+export const AGENT_SESSION_PG_SCHEMA = AGENT_SESSION_PG_MIGRATIONS.migrations
+  .map((migration) => migration.up)
+  .join('');
 
 function quoteIdentifier(identifier: string): string {
   if (!/^[a-z_][a-z0-9_]*$/.test(identifier)) {
@@ -304,14 +380,14 @@ function resolveTableNames(overrides?: Partial<AgentSessionTableNames>): AgentSe
   return names;
 }
 
-function schemaFor(names: AgentSessionTableNames): string {
-  if (
-    Object.entries(DEFAULT_AGENT_SESSION_TABLE_NAMES).every(
-      ([key, value]) => names[key as keyof AgentSessionTableNames] === value,
-    )
-  ) {
-    return AGENT_SESSION_PG_SCHEMA;
-  }
+function usesDefaultTableNames(names: AgentSessionTableNames): boolean {
+  return Object.entries(DEFAULT_AGENT_SESSION_TABLE_NAMES).every(
+    ([key, value]) => names[key as keyof AgentSessionTableNames] === value,
+  );
+}
+
+/** Rewrite default-name schema SQL for overridden table names. */
+function renameTables(names: AgentSessionTableNames, sql: string): string {
   const s = quoteIdentifier(names.sessions);
   const e = quoteIdentifier(names.events);
   const t = quoteIdentifier(names.entries);
@@ -322,7 +398,8 @@ function schemaFor(names: AgentSessionTableNames): string {
   // index names (`agent_sessions_status_live_idx`, ...) are re-keyed by the
   // same replaceAll that re-keys their tables, so no separate prefix rewriting
   // is performed or needed.
-  return AGENT_SESSION_PG_SCHEMA.replaceAll(TITLE_STATE_CONSTRAINT, TITLE_STATE_CONSTRAINT_SENTINEL)
+  return sql
+    .replaceAll(TITLE_STATE_CONSTRAINT, TITLE_STATE_CONSTRAINT_SENTINEL)
     .replaceAll(OWNER_EVENT_TYPE_CONSTRAINT_V2, OWNER_EVENT_TYPE_CONSTRAINT_V2_SENTINEL)
     .replaceAll('agent_owner_session_event_counters', names.ownerEventCounters)
     .replaceAll('agent_owner_session_events', names.ownerEvents)
@@ -356,7 +433,9 @@ function schemaFor(names: AgentSessionTableNames): string {
 }
 
 /**
- * Create all backend-owned tables when absent and apply their additive migrations.
+ * Create all backend-owned tables, or bring an existing database up to date, by
+ * applying the pending {@link AGENT_SESSION_PG_MIGRATIONS}. Safe to call on every
+ * start; a schema change is a new migration.
  *
  * Call this on a queryable that is not already inside an explicit transaction.
  * Constraint installs and validations are separate statements so each install's
@@ -366,10 +445,21 @@ export async function ensureAgentSessionSchema(
   queryable: Queryable,
   tableNames?: Partial<AgentSessionTableNames>,
 ): Promise<void> {
-  const schema = schemaFor(resolveTableNames(tableNames));
-  for (const statement of splitSqlStatements(schema)) {
-    await queryable.query(statement);
+  const names = resolveTableNames(tableNames);
+  if (usesDefaultTableNames(names)) {
+    await applySchemaMigrations(queryable, AGENT_SESSION_PG_MIGRATIONS);
+    return;
   }
+  // Overridden tables are their own store: their versions are recorded apart
+  // from the default tables', which may live in the same database.
+  await applySchemaMigrations(
+    queryable,
+    {
+      store: `agent-session:${Object.values(names).join(',')}`,
+      migrations: AGENT_SESSION_PG_MIGRATIONS.migrations,
+    },
+    { rewriteSql: (sql) => renameTables(names, sql) },
+  );
 }
 
 interface SessionRow extends Record<string, unknown> {
@@ -380,6 +470,7 @@ interface SessionRow extends Record<string, unknown> {
   stage_id: string;
   skill_id: string | null;
   origin: string | null;
+  locale: string | null;
   existing_course: boolean;
   status: AgentSessionMeta['status'];
   attempt: number;
@@ -388,13 +479,26 @@ interface SessionRow extends Record<string, unknown> {
   lease_worker_pid: number | null;
   lease_heartbeat_at: number | string | null;
   error: string | null;
+  open_question_seq: number | null;
   created_at: Date | string;
   updated_at: Date | string;
 }
 
-const SESSION_COLUMNS = `id, owner_id, prompt, title, stage_id, skill_id, origin,
+const SESSION_COLUMNS = `id, owner_id, prompt, title, stage_id, skill_id, origin, locale,
   existing_course, status, attempt, delivered_user_message_seq, lease_worker_id, lease_worker_pid,
-  lease_heartbeat_at, error, created_at, updated_at`;
+  lease_heartbeat_at, error, open_question_seq, created_at, updated_at`;
+
+/**
+ * A session awaits an answer when its newest question is unanswered and no run
+ * is in flight. A queued or running session is already acting on the
+ * conversation, so "waiting for you" would be wrong there whatever the log says.
+ */
+function awaitsAnswer(
+  status: AgentSessionMeta['status'],
+  openQuestionSeq: number | string | null | undefined,
+): boolean {
+  return openQuestionSeq != null && status !== 'queued' && status !== 'running';
+}
 
 function epoch(value: Date | string): number {
   return value instanceof Date ? value.getTime() : new Date(value).getTime();
@@ -418,6 +522,7 @@ function sessionMeta(row: SessionRow): AgentSessionMeta {
     stageId: row.stage_id,
     ...(row.skill_id ? { skillId: row.skill_id } : {}),
     ...(row.origin ? { origin: row.origin } : {}),
+    ...(row.locale ? { locale: row.locale } : {}),
     existingCourse: row.existing_course,
     status: row.status,
     attempt: Number(row.attempt),
@@ -434,17 +539,8 @@ function sessionMeta(row: SessionRow): AgentSessionMeta {
         }
       : {}),
     ...(row.error ? { error: row.error } : {}),
+    ...(awaitsAnswer(row.status, row.open_question_seq) ? { awaitingAnswer: true } : {}),
   };
-}
-
-function encodeJson(value: unknown, label: string): string {
-  try {
-    const encoded = JSON.stringify(value === undefined ? null : value);
-    if (encoded === undefined) throw new TypeError('value is not JSON-serializable');
-    return encoded;
-  } catch (error) {
-    throw new Error(`@openmaic/storage: ${label} is not JSON-serializable`, { cause: error });
-  }
 }
 
 function decodedObject(value: unknown): Record<string, unknown> {
@@ -457,6 +553,7 @@ let savepointSerial = 0;
 export class PgAgentSessionStore
   implements
     AgentSessionStore,
+    AgentSessionSkillStore,
     AgentSessionTitleStore,
     AgentSessionAutomaticTitleStore,
     AgentSessionEventLog,
@@ -535,13 +632,13 @@ export class PgAgentSessionStore
       const result = await tx.query<SessionRow>(
         `INSERT INTO ${this.table('sessions')}
           (id, owner_id, prompt, title, title_state, stage_id, skill_id, origin, existing_course,
-           status, attempt)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0)
+           status, attempt, locale)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)
          RETURNING ${SESSION_COLUMNS}`,
         [
           id,
           ownerId,
-          input.prompt,
+          sanitizePgText(input.prompt),
           title,
           input.titleState ?? 'manual',
           input.stageId ?? `stage-${id.slice(0, 8)}`,
@@ -549,6 +646,7 @@ export class PgAgentSessionStore
           input.origin ?? null,
           input.existingCourse ?? false,
           input.status ?? 'queued',
+          input.locale ? sanitizePgText(input.locale).slice(0, 35) : null,
         ],
       );
       const meta = sessionMeta(result.rows[0]!);
@@ -592,7 +690,7 @@ export class PgAgentSessionStore
          SET title = $3, title_state = 'manual', updated_at = clock_timestamp()
          WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
          RETURNING ${SESSION_COLUMNS}`,
-        [sessionId, ownerId, title],
+        [sessionId, ownerId, title === null ? null : sanitizePgText(title)],
       );
       const row = result.rows[0];
       if (!row) return null;
@@ -648,7 +746,8 @@ export class PgAgentSessionStore
     ownerId: string,
     title: string,
   ): Promise<AgentSessionMeta | null> {
-    if (title.trim() === '') return null;
+    const safeTitle = sanitizePgText(title);
+    if (safeTitle.trim() === '') return null;
     return this.transaction(async (tx) => {
       const result = await tx.query<SessionRow>(
         `UPDATE ${this.table('sessions')}
@@ -656,7 +755,7 @@ export class PgAgentSessionStore
          WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
            AND title_state = 'automatic' AND title = ''
          RETURNING ${SESSION_COLUMNS}`,
-        [sessionId, ownerId, title],
+        [sessionId, ownerId, safeTitle],
       );
       const row = result.rows[0];
       if (!row) return null;
@@ -696,6 +795,9 @@ export class PgAgentSessionStore
     const staleBefore = this.clock() - options.leaseTtlMs;
     const params: unknown[] = [staleBefore, workerId, options.maxAttempts + 1];
     const targeted = options.sessionId ? ` AND id = $${params.push(options.sessionId)}` : '';
+    const excluded = options.excludeSessionIds?.length
+      ? ` AND NOT(id=ANY($${params.push([...options.excludeSessionIds])}::text[]))`
+      : '';
     // A successful ask_user is durable in the event log before the run settles.
     // Textless user messages may carry newly attached materials, but they are
     // not answers. Keep such work queued until a later nonblank user message
@@ -722,7 +824,7 @@ export class PgAgentSessionStore
               (status = 'running'
                AND (lease_heartbeat_at IS NULL OR lease_heartbeat_at < $1)
                AND (lease_worker_id IS NULL OR lease_worker_id <> $2)))
-         AND (attempt < $3 OR status = 'running')${askAdmission}${targeted}
+         AND (attempt < $3 OR status = 'running')${askAdmission}${targeted}${excluded}
        ORDER BY created_at LIMIT 5`,
       params,
     );
@@ -905,7 +1007,7 @@ export class PgAgentSessionStore
           workerId,
           patch.status,
           patch.error !== undefined,
-          patch.error ?? null,
+          patch.error == null ? null : sanitizePgText(patch.error),
           release,
           patch.resetAttempt === true,
           patch.consumeCancelRequestedAt ?? null,
@@ -968,6 +1070,7 @@ export class PgAgentSessionStore
       [sessionId, event.ts, event.attempt, event.type, encodeJson(event.data, 'event data')],
     );
     const seq = Number(result.rows[0]!.seq);
+    await this.trackOpenQuestion(tx, sessionId, event, seq);
     // Transactional wakeup: the host queues a lossy NOTIFY on the SAME
     // transaction, so the SSE tail and the runner wake exactly when this row
     // commits. PG delivers NOTIFY only at commit, so no reader can observe
@@ -983,6 +1086,36 @@ export class PgAgentSessionStore
     return seq;
   }
 
+  /**
+   * Keep `open_question_seq` in step with the log, in the append's own
+   * transaction: a question opens it, and non-blank user text closes it —
+   * the same "any later message answers" rule the chat fold and
+   * `postUserMessage` apply, since `ask_user` has no answer-correlation id. A
+   * textless message (an attached material) is not an answer.
+   */
+  private async trackOpenQuestion(
+    tx: Queryable,
+    sessionId: string,
+    event: NewAgentSessionEvent,
+    seq: number,
+  ): Promise<void> {
+    if (event.type === AGENT_SESSION_LIFECYCLE.userQuestion) {
+      await tx.query(`UPDATE ${this.table('sessions')} SET open_question_seq = $2 WHERE id = $1`, [
+        sessionId,
+        seq,
+      ]);
+      return;
+    }
+    if (event.type !== AGENT_SESSION_LIFECYCLE.userMessage) return;
+    const text = (event.data as { text?: unknown } | null)?.text;
+    if (typeof text !== 'string' || !text.trim()) return;
+    await tx.query(
+      `UPDATE ${this.table('sessions')} SET open_question_seq = NULL
+       WHERE id = $1 AND open_question_seq IS NOT NULL`,
+      [sessionId],
+    );
+  }
+
   async appendRunEvent(
     sessionId: string,
     workerId: string,
@@ -992,6 +1125,26 @@ export class PgAgentSessionStore
       const parent = await this.lockForAppend(tx, sessionId, workerId);
       if (!parent || Number(parent.attempt) !== event.attempt) return null;
       return this.insertEvent(tx, sessionId, event);
+    });
+  }
+
+  async detachSessionSkill(
+    sessionId: string,
+    input: Parameters<AgentSessionSkillStore['detachSessionSkill']>[1],
+  ): Promise<boolean> {
+    return this.transaction(async (tx) => {
+      const result = await tx.query<{ id: string }>(
+        `UPDATE ${this.table('sessions')}
+         SET skill_id = NULL, updated_at = now()
+         WHERE id = $1 AND owner_id = $2 AND skill_id = $3
+           AND lease_worker_id = $4 AND attempt = $5
+           AND status = 'running' AND deleted_at IS NULL
+         RETURNING id`,
+        [sessionId, input.ownerId, input.skillId, input.workerId, input.attempt],
+      );
+      if (!result.rows.length) return false;
+      await this.insertEvent(tx, sessionId, { ...input.notice, attempt: input.attempt });
+      return true;
     });
   }
 
@@ -1070,6 +1223,7 @@ export class PgAgentSessionStore
       materials?: unknown[];
       elementRefs?: unknown[];
       courseRefs?: unknown[];
+      locale?: string;
     },
     options: PostAgentUserMessageOptions = {},
   ): Promise<PostAgentUserMessageResult> {
@@ -1116,6 +1270,7 @@ export class PgAgentSessionStore
           ...(input.materials?.length ? { materials: input.materials } : {}),
           ...(input.elementRefs?.length ? { elementRefs: input.elementRefs } : {}),
           ...(input.courseRefs?.length ? { courseRefs: input.courseRefs } : {}),
+          ...(input.locale ? { locale: input.locale.slice(0, 35) } : {}),
         },
       });
       const row = await this.loadSession(tx, sessionId, false);
@@ -1168,6 +1323,7 @@ export class PgAgentSessionStore
         delivery: String(data.delivery ?? ''),
         materials: Array.isArray(data.materials) ? data.materials : [],
         ...(Array.isArray(data.courseRefs) ? { courseRefs: data.courseRefs } : {}),
+        ...(typeof data.locale === 'string' && data.locale ? { locale: data.locale } : {}),
       };
     });
   }
@@ -1317,14 +1473,15 @@ export class PgAgentSessionStore
     return this.transaction((tx) => this.requeueIn(tx, sessionId, false));
   }
 
-  async requestCancel(sessionId: string): Promise<void> {
+  async requestCancel(sessionId: string, options?: { settle?: boolean }): Promise<void> {
     await this.transaction(async (tx) => {
       const ts = this.clock();
       const result = await tx.query<{ id: string }>(
         `UPDATE ${this.table('sessions')}
          SET cancel_requested_at = $2, updated_at = now()
-         WHERE id = $1 AND deleted_at IS NULL AND cancel_requested_at IS NULL RETURNING id`,
-        [sessionId, ts],
+         WHERE id = $1 AND deleted_at IS NULL AND cancel_requested_at IS NULL
+           AND (NOT $3::boolean OR status IN ('queued','running')) RETURNING id`,
+        [sessionId, ts, options?.settle === true],
       );
       if (result.rows[0]) {
         await this.appendProjection({ type: 'session_cancel_requested', sessionId, ts }, tx);
@@ -1332,6 +1489,16 @@ export class PgAgentSessionStore
         // its per-session SSE reader) at COMMIT, so an abort lands within
         // milliseconds instead of on the fallback poll (reference semantics).
         await this.cancelHook?.(tx, sessionId);
+      }
+      if (options?.settle) {
+        const pending = await tx.query<{ attempt: number }>(
+          `SELECT attempt FROM ${this.table('sessions')}
+           WHERE id=$1 AND deleted_at IS NULL AND status IN ('queued','running')
+             AND cancel_requested_at IS NOT NULL FOR UPDATE`,
+          [sessionId],
+        );
+        if (pending.rows[0])
+          await this.settleCancelledAtClaim(tx, sessionId, ts, Number(pending.rows[0].attempt));
       }
     });
   }
@@ -1484,8 +1651,12 @@ export class PgAgentSessionStore
     const savepoint = `agent_session_projection_${(savepointSerial += 1)}`;
     try {
       await transaction.query(`SAVEPOINT ${savepoint}`);
-      const locked = await transaction.query<{ owner_id: string }>(
-        `SELECT owner_id FROM ${this.table('sessions')} WHERE id = $1 FOR UPDATE`,
+      const locked = await transaction.query<{
+        owner_id: string;
+        open_question_seq: number | null;
+      }>(
+        `SELECT owner_id, open_question_seq FROM ${this.table('sessions')}
+         WHERE id = $1 FOR UPDATE`,
         [event.sessionId],
       );
       const session = locked.rows[0];
@@ -1504,7 +1675,29 @@ export class PgAgentSessionStore
       if (!counter) throw new Error(`cannot allocate owner event id for ${session.owner_id}`);
       const status = 'status' in event ? event.status : null;
       const attempt = 'attempt' in event ? event.attempt : null;
-      const data = event.type === 'session_title' ? { title: event.title } : {};
+      // A status summary carries the store's own awaiting-answer verdict for
+      // the status it records, read under the row lock in the same
+      // transaction. Whatever the caller passed is ignored: the fact belongs
+      // to the event log, not to the writer of the status.
+      const projected: NewOwnerSessionEvent =
+        event.type === 'session_created' || event.type === 'session_status'
+          ? {
+              type: event.type,
+              sessionId: event.sessionId,
+              ts: event.ts,
+              status: event.status,
+              attempt: event.attempt,
+              ...(awaitsAnswer(event.status, session.open_question_seq)
+                ? { awaitingAnswer: true }
+                : {}),
+            }
+          : event;
+      const data =
+        projected.type === 'session_title'
+          ? { title: projected.title }
+          : 'awaitingAnswer' in projected && projected.awaitingAnswer
+            ? { awaitingAnswer: true }
+            : {};
       await transaction.query(
         `INSERT INTO ${this.table('ownerEvents')}
           (owner_id, id, ts, session_id, type, status, attempt, data)
@@ -1524,7 +1717,7 @@ export class PgAgentSessionStore
       // NOTIFY is emitted only when the outer mutation commits, and a failed
       // projection rolls it back with the owner row.
       await this.ownerEventHook?.(transaction, {
-        ...event,
+        ...projected,
         id: String(counter.n),
         ownerId: session.owner_id,
       });
@@ -1579,6 +1772,7 @@ export class PgAgentSessionStore
           type: row.type,
           status: row.status!,
           attempt: Number(row.attempt ?? 0),
+          ...(decodedObject(row.data).awaitingAnswer === true ? { awaitingAnswer: true } : {}),
         };
       }
       if (row.type === 'session_title') {

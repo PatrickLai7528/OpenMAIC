@@ -24,15 +24,20 @@
  *    text is non-empty, so "disabled when nothing is picked or filled" needs no
  *    separate validity flag that could disagree with what would actually be sent.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { useQuestionDraft } from '@/lib/workbench/question-host';
 import type { ChatNode, QuestionOption } from '@/lib/workbench/session-store';
 import { defaultWorkbenchTranslator, type WorkbenchTranslator } from '@/lib/i18n/workbench';
 import {
+  isFreeTextOption,
   isQuestionLocked,
   questionMode,
   togglePicked,
   multiAnswerSeparator,
 } from './question-card-state';
+
+// The reserved free-text option lives with the card's rules; re-exported for the form's callers.
+export { FREE_TEXT_OPTION_ID, isFreeTextOption } from './question-card-state';
 
 /**
  * The free-text row's label, and what the keyboard hint calls it — in the
@@ -72,8 +77,14 @@ export function composerTakeover(input: {
  * would be one collision away from sending the sentinel as an answer.
  */
 export type QuestionFormRow =
-  | { readonly kind: 'option'; readonly id: string; readonly label: string }
-  | { readonly kind: 'other' };
+  | {
+      readonly kind: 'option';
+      readonly id: string;
+      readonly label: string;
+      readonly recommended?: true;
+    }
+  /** `label` is the agent's own wording for it, when it supplied the row. */
+  | { readonly kind: 'other'; readonly label?: string };
 
 /** What is selected right now: envelope option ids, plus whether the "other" row is on. */
 export interface QuestionFormPicks {
@@ -90,9 +101,12 @@ export const NO_PICKS: QuestionFormPicks = { picked: [], otherPicked: false };
 export function questionFormRows(node: ChatNode): QuestionFormRow[] {
   const options = node.questionOptions ?? [];
   if (options.length === 0) return [];
+  const own = options.find((option) => isFreeTextOption(option.id));
   return [
-    ...options.map((option): QuestionFormRow => ({ kind: 'option', ...option })),
-    { kind: 'other' },
+    ...options
+      .filter((option) => option !== own)
+      .map((option): QuestionFormRow => ({ kind: 'option', ...option })),
+    own ? { kind: 'other', label: own.label } : { kind: 'other' },
   ];
 }
 
@@ -171,6 +185,28 @@ export function quickPickIndex(key: string, rowCount: number): number | null {
   if (key.length !== 1 || key < '1' || key > '9') return null;
   const index = Number(key) - 1;
   return index < rowCount ? index : null;
+}
+
+/**
+ * Marks the form's own keyboard stops: the option rows and submit. Arrow keys,
+ * digits and Enter are the form's there.
+ */
+export const QUESTION_NAV_ATTR = 'data-question-nav';
+
+const CONTROLS =
+  'button, a[href], [role="switch"], select, [contenteditable=""], [contenteditable="true"]';
+
+/**
+ * Whether a key event comes from a control that owns its own keys — the
+ * auto-confirm switch, Collapse, a details toggle, a link in the question —
+ * rather than from an option row, submit or the form's text boxes. Enter and
+ * Space there must do what that control does (toggle, collapse, expand), not
+ * pick the highlighted row; only Escape still belongs to the form.
+ */
+export function isForeignKeyTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  if (target.closest(`[${QUESTION_NAV_ATTR}]`)) return false;
+  return target.closest(CONTROLS) !== null;
 }
 
 /** Whether the event's target is a text box, and whether Enter belongs to it. */
@@ -260,6 +296,8 @@ export function useQuestionForm(
   node: ChatNode,
   onAnswer?: (text: string) => Promise<boolean>,
   t: WorkbenchTranslator = defaultWorkbenchTranslator,
+  /** Open on the free-text row, picked: the user asked to write the answer. */
+  startInFreeText = false,
 ): {
   mode: 'open' | 'single' | 'multi';
   rows: QuestionFormRow[];
@@ -279,28 +317,51 @@ export function useQuestionForm(
   /** Keyboard: confirm this row (single choice sends; past the last row is submit). */
   activate: (index: number) => void;
   submit: () => void;
+  /**
+   * Answer with exactly this option, as picking it alone and submitting would
+   * (the auto-confirm path). Resolves whether the send was accepted.
+   */
+  answerWithOption: (id: string) => Promise<boolean>;
 } {
   const mode = questionMode(node);
   const options = node.questionOptions ?? [];
   const rows = useMemo(() => questionFormRows(node), [node]);
-  const [picks, setPicks] = useState<QuestionFormPicks>(NO_PICKS);
-  const [highlight, setHighlight] = useState(0);
-  const [otherText, setOtherText] = useState('');
-  const [openText, setOpenText] = useState('');
+  const startOther = startInFreeText && rows.length > 0;
+  // The answer in progress is the question's one shared draft: the card, this
+  // form and the preview's form all read and write it.
+  const answered = Boolean(node.questionAnswered);
+  const { draft, update } = useQuestionDraft(node.key, answered);
+  const picks: QuestionFormPicks = { picked: draft.picked, otherPicked: draft.otherPicked };
+  const { otherText, openText } = draft;
+  const setPicks = (next: QuestionFormPicks) =>
+    update({ picked: next.picked, otherPicked: next.otherPicked });
+  const setOtherText = (text: string) => update({ otherText: text });
+  const setOpenText = (text: string) => update({ openText: text });
+  const [highlight, setHighlight] = useState(() => (startOther ? rows.length - 1 : 0));
+  // Asked to write: the free-text row turns on, keeping any canned picks.
+  const [startedOther] = useState(startOther);
+  useEffect(() => {
+    if (startedOther && !draft.otherPicked) {
+      update({ otherPicked: true, ...(mode === 'multi' ? {} : { picked: [] }) });
+    }
+    // Once, on opening.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [sending, setSending] = useState(false);
 
   const locked = isQuestionLocked({
-    answered: Boolean(node.questionAnswered),
+    answered,
     sending,
     canSend: Boolean(onAnswer),
   });
   const answerText = formAnswerText({ mode, options, picks, otherText, openText, t });
 
-  const send = (text: string) => {
-    if (locked || !onAnswer || !text) return;
+  const send = (text: string): Promise<boolean> => {
+    if (locked || !onAnswer || !text) return Promise.resolve(false);
     setSending(true);
-    void onAnswer(text).then((ok) => {
+    return onAnswer(text).then((ok) => {
       if (!ok) setSending(false);
+      return ok;
     });
   };
 
@@ -345,16 +406,24 @@ export function useQuestionForm(
       if (locked) return;
       // Past the last row is submit — one highlight space, one Enter.
       if (index >= rows.length) {
-        send(answerText);
+        void send(answerText);
         return;
       }
       const next = pick(index);
       // A single-choice canned row IS the answer. The "other" row never sends on
       // confirm: there is a box to fill first, and the focus lands in it.
       if (next && mode === 'single' && rows[index]?.kind === 'option') {
-        send(formAnswerText({ mode, options, picks: next, otherText, openText, t }));
+        void send(formAnswerText({ mode, options, picks: next, otherText, openText, t }));
       }
     },
-    submit: () => send(answerText),
+    submit: () => void send(answerText),
+    answerWithOption: (id) => {
+      if (locked || !rows.some((row) => row.kind === 'option' && row.id === id)) {
+        return Promise.resolve(false);
+      }
+      const only: QuestionFormPicks = { picked: [id], otherPicked: false };
+      setPicks(only);
+      return send(formAnswerText({ mode, options, picks: only, otherText: '', openText: '', t }));
+    },
   };
 }

@@ -34,7 +34,7 @@ Required peers:
 
 Optional peers (install only if your slides use the corresponding element type):
 
-- `echarts >= 5` — for chart elements
+- `echarts >= 5.5` — for chart elements (uses endpoint label alignment for compact charts)
 - `shiki >= 1` — for code elements
 
 ## Quickstart
@@ -84,7 +84,7 @@ The canvas auto-fits its parent container. The parent must have a defined `width
 
 ### `<SlideCanvas slide effects? renderImage? renderVideo? onElementClick? scale? background? />`
 
-The main read-only entry. Reads everything from props; zero global state.
+The main read-only entry. Reads slide data and rendering options from props.
 
 ```ts
 interface SlideCanvasProps {
@@ -97,12 +97,25 @@ interface SlideCanvasProps {
   renderImage?: (el, src, defaultContent) => ReactNode;
   renderVideo?: (el) => ReactNode;
   videoInteractive?: boolean;           // defaults true; set false to disable video pointer interaction
+  mathPriority?: 'normal' | 'background'; // defaults normal; use background for thumbnails
   onElementClick?: (el, event) => void;
   elementIdPrefix?: string;
   className?: string;
   style?: CSSProperties;
 }
 ```
+
+Inline formulas share a 256,000-character markup budget so oversized slides can
+yield between batches while dense ordinary slides still fit before paint.
+A short formula following heavy content in the same frame may also be deferred.
+Use `mathPriority="background"` for thumbnails: newly mounted or changed content
+shares a copy of the frame's remaining allowance after foreground layout effects,
+before paint. This leaves foreground capacity available if the user switches slides
+after thumbnails mount in the same frame; that frame may use both allowances.
+Remaining formulas stay hidden until rendered in idle time after foreground
+canvases; unrelated parent rerenders do not advance that queued work. Formulas
+that cannot be typeset still appear as text. Snapshot APIs still finish all
+formulas synchronously within the existing per-prose-root hard caps.
 
 ### Play-time effects
 
@@ -211,6 +224,20 @@ once at your app shell to make those faces available:
 import '@openmaic/renderer/fonts.css';
 ```
 
+Slides whose fonts were picked in `@openmaic/editor`'s default picker name the
+Google Fonts versions of those typefaces (`Noto Sans SC`, `Noto Serif SC`,
+`LXGW WenKai`, `ZCOOL KuaiLe`). To render them, also import the opt-in alias
+sheet, which maps those names onto the same files:
+
+```ts
+import '@openmaic/renderer/picker-fonts.css';
+```
+
+It claims the four names for the whole page with no `unicode-range`: any text
+set in one of them renders with, and downloads, the whole self-hosted file
+(SourceHanSans is about 7.5 MB, SourceHanSerif about 10 MB). Leave it out if
+your page loads its own faces under these names.
+
 > **Runtime dependency — read this.** The `@font-face` `src` URLs point at an
 > external font host (`https://file.maic.chat/fonts/<name>.woff2`); the woff2
 > files are **not** bundled in the package. So this is a hard runtime dependency:
@@ -236,3 +263,10 @@ import '@openmaic/renderer/fonts.css';
 ## License
 
 MIT
+
+## Geometry without rendering
+
+Import `getElementRange` and `getLineElementPath` from `@openmaic/renderer/geometry`
+to reuse the renderer's geometry in Node or server-side document operations without
+loading React components. Line ranges include endpoint minima and active control
+points; curves use a conservative control hull.

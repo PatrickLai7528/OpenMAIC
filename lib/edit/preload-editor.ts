@@ -1,18 +1,19 @@
 /**
- * Lazily load the editor-only side effects, keeping them out of the
- * flag-off classroom/playback bundle:
- *   1. `editor-fonts` — ~23 @fontsource font-face tables the slide font
- *      picker needs (CSS side effect).
- *   2. `surfaces/slide` + `surfaces/quiz` — register their SceneEditorSurfaces
- *      into `sceneEditorRegistry` so EditShell can resolve them (otherwise it
- *      falls back to NOOP_SURFACE, i.e. a read-only flash).
+ * Lazily load the editor chunk, keeping it out of the flag-off
+ * classroom/playback bundle: `surfaces/slide` + `surfaces/quiz` register their
+ * SceneEditorSurfaces into `sceneEditorRegistry` so EditShell can resolve them
+ * (otherwise it falls back to NOOP_SURFACE, i.e. a read-only flash).
  *
- * Called from the Pro Switch handler BEFORE flipping into edit mode, so
- * the dynamic chunk is already downloaded/registered by the time the
- * edit chrome mounts and animates in — no mid-animation "content pops in"
- * jank, and the slide surface is registered before EditShell reads the
- * registry. The promise is cached so repeated toggles and any belt-and-
+ * Called from the Learn→Edit switch BEFORE flipping into edit mode, so the
+ * surfaces are registered by the time EditShell reads the registry and the
+ * edit chrome animates in with its content present; also from the idle
+ * warm-up and, for a course remembered in Edit, alongside its document. The
+ * promise is cached so repeated toggles, the warm-ups and any belt-and-
  * suspenders caller share one in-flight import.
+ *
+ * The slide font picker's fonts are not loaded here: a slide renders its
+ * picked font everywhere, so the root layout declares them on every page
+ * (`app/slide-fonts.ts`).
  */
 let editorReady: Promise<void> | null = null;
 let editorLoaded = false;
@@ -20,7 +21,7 @@ let editorLoaded = false;
 /**
  * Whether the editor chunk is ALREADY registered, answered synchronously.
  *
- * The workspace pane is edit-locked, so a remount there (a course switch, a
+ * A hosted course can remember editing, so a remount there (a course switch, a
  * reopened tab) must be able to resolve straight to the edit chrome during
  * render. Waiting for `preloadEditor()` to resolve again would cost a paint of
  * the neutral loading shell for an import that finished long ago.
@@ -32,7 +33,6 @@ export function isEditorPreloaded(): boolean {
 export function preloadEditor(): Promise<void> {
   if (!editorReady) {
     const attempt = Promise.all([
-      import('@/app/editor-fonts'),
       import('@/components/edit/surfaces/slide'),
       import('@/components/edit/surfaces/quiz'),
     ]).then(() => {

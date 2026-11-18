@@ -25,9 +25,11 @@
 import {
   ALIDOCMIND_MEDIA_MIMES,
   ALIDOCMIND_MIMES,
+  DEEPSEEK_OCR_MIMES,
   DOCUMENT_MIME_TYPES,
   MINERU_CLOUD_MIMES,
   MINERU_SELFHOST_MIMES,
+  MINICPM_OCR_MIMES,
   PLAIN_TEXT_MIMES,
   LOCAL_FFMPEG_MEDIA_MIMES,
 } from '../mime';
@@ -40,6 +42,12 @@ export interface DocumentExtractorManifestEntry {
   version: string;
   supportedMimeTypes: readonly string[];
   capabilities: DocumentExtractorCapabilities;
+  /**
+   * Whether extraction calls a service the operator must configure (a
+   * server-providers.yml `pdf` entry or `PDF_*` env). Self-contained
+   * extractors run in-process and are always available.
+   */
+  requiresServiceConfig: boolean;
 }
 
 /** One media extractor's metadata, exactly as the server registry serves it. */
@@ -49,6 +57,11 @@ export interface MediaExtractorManifestEntry {
   version: string;
   supportedMimeTypes: readonly string[];
   capabilities: MediaExtractorCapabilities;
+  /**
+   * Whether transcribing an audio track needs a server ASR provider. Such an
+   * extractor can still read a video without an audio track (keyframes only).
+   */
+  requiresServerASR: boolean;
 }
 
 /**
@@ -63,6 +76,7 @@ const DOCUMENT_EXTRACTOR_MANIFEST: Record<string, DocumentExtractorManifestEntry
     displayName: 'Plain Text',
     version: '1',
     supportedMimeTypes: PLAIN_TEXT_MIMES,
+    requiresServiceConfig: false,
     capabilities: {
       text: true,
       images: false,
@@ -78,6 +92,7 @@ const DOCUMENT_EXTRACTOR_MANIFEST: Record<string, DocumentExtractorManifestEntry
     displayName: 'unpdf',
     version: '1',
     supportedMimeTypes: [DOCUMENT_MIME_TYPES.pdf],
+    requiresServiceConfig: false,
     capabilities: {
       text: true,
       images: true,
@@ -93,6 +108,7 @@ const DOCUMENT_EXTRACTOR_MANIFEST: Record<string, DocumentExtractorManifestEntry
     displayName: 'MinerU',
     version: '1',
     supportedMimeTypes: MINERU_SELFHOST_MIMES,
+    requiresServiceConfig: true,
     capabilities: {
       text: true,
       images: true,
@@ -108,6 +124,7 @@ const DOCUMENT_EXTRACTOR_MANIFEST: Record<string, DocumentExtractorManifestEntry
     displayName: 'MinerU (Cloud)',
     version: '1',
     supportedMimeTypes: MINERU_CLOUD_MIMES,
+    requiresServiceConfig: true,
     capabilities: {
       text: true,
       images: true,
@@ -123,6 +140,7 @@ const DOCUMENT_EXTRACTOR_MANIFEST: Record<string, DocumentExtractorManifestEntry
     displayName: 'AliDocMind',
     version: '1',
     supportedMimeTypes: ALIDOCMIND_MIMES,
+    requiresServiceConfig: true,
     capabilities: {
       text: true,
       images: true,
@@ -131,6 +149,40 @@ const DOCUMENT_EXTRACTOR_MANIFEST: Record<string, DocumentExtractorManifestEntry
       layout: true,
       ocr: true,
       async: true,
+    },
+  },
+  'minicpm-ocr': {
+    id: 'minicpm-ocr',
+    displayName: 'MiniCPM-OCR',
+    version: '1',
+    supportedMimeTypes: MINICPM_OCR_MIMES,
+    requiresServiceConfig: true,
+    capabilities: {
+      text: true,
+      // The parser returns Markdown (tables and formulas included), not
+      // extracted image files.
+      images: false,
+      tables: true,
+      formulas: true,
+      layout: true,
+      ocr: true,
+      async: true,
+    },
+  },
+  'deepseek-ocr': {
+    id: 'deepseek-ocr',
+    displayName: 'DeepSeek OCR',
+    version: '1',
+    supportedMimeTypes: DEEPSEEK_OCR_MIMES,
+    requiresServiceConfig: true,
+    capabilities: {
+      text: true,
+      images: true,
+      tables: true,
+      formulas: true,
+      layout: true,
+      ocr: true,
+      async: false,
     },
   },
 };
@@ -142,6 +194,7 @@ const MEDIA_EXTRACTOR_MANIFEST: Record<string, MediaExtractorManifestEntry> = {
     displayName: 'AliDocMind',
     version: '1',
     supportedMimeTypes: ALIDOCMIND_MEDIA_MIMES,
+    requiresServerASR: false,
     capabilities: {
       transcript: true,
       keyframes: true,
@@ -155,6 +208,7 @@ const MEDIA_EXTRACTOR_MANIFEST: Record<string, MediaExtractorManifestEntry> = {
     displayName: 'Local ffmpeg',
     version: '1',
     supportedMimeTypes: LOCAL_FFMPEG_MEDIA_MIMES,
+    requiresServerASR: true,
     capabilities: {
       transcript: true,
       keyframes: true,

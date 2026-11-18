@@ -9,6 +9,9 @@ import type { Pool } from 'pg';
 
 import { getServerPersistenceProvider } from '@/lib/persistence/server-provider';
 import { notifyDurableAgentEvent } from './event-notify-bus';
+import type { ConnectableQueryable } from '@openmaic/storage/server/reference';
+import { forwardOwnerWrite } from '@/lib/persistence/owner-merges';
+import { withSchemaBootstrapLock } from '@/lib/persistence/schema-bootstrap-lock';
 
 interface AgentSessionStoreState {
   connectionString?: string;
@@ -29,29 +32,45 @@ export function nodePostgresTransaction(pool: Pool): WithTransaction {
   return async <T>(body: (queryable: Queryable) => Promise<T>): Promise<T> => {
     const client = await pool.connect();
     try {
-      await client.query('BEGIN');
-      const result = await body(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
+      return await transactionOn(client, body);
     } finally {
       client.release();
     }
   };
 }
 
-async function createAgentSessionStore(connectionString: string): Promise<PgAgentSessionStore> {
-  const { pool } = await getServerPersistenceProvider(connectionString);
-  await ensureAgentSessionSchema(pool);
+async function transactionOn<T>(
+  client: Queryable,
+  body: (queryable: Queryable) => Promise<T>,
+): Promise<T> {
+  try {
+    await client.query('BEGIN');
+    const result = await body(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  }
+}
+
+function sessionStore(queryable: Queryable, withTransaction: WithTransaction): PgAgentSessionStore {
   // URL observations from user-authored prompt/message text are registered
   // inside the same business transaction that creates the session / posts the
   // message (reference session-store semantics), so they commit atomically and
   // a registration failure aborts the write. The hooks run only after the
   // store is constructed, so the closure reference is always assigned.
-  const store: PgAgentSessionStore = new PgAgentSessionStore(pool, {
-    withTransaction: nodePostgresTransaction(pool),
+  const store: PgAgentSessionStore = new PgAgentSessionStore(queryable, {
+    withTransaction,
+    // The owner a session write is for, under that owner's identity lock (the
+    // transaction's first statement, as the package requires): a retired
+    // anonymous owner resolves to the account it was claimed into. This is
+    // what makes `readRetirement` tell a stale owner-events stream to
+    // reconnect, and `postUserMessage` refuse a request that still presents
+    // the retired identity. `POST /api/agent/sessions` refuses one before it
+    // gets here; a create racing the claim is written for the account, as if
+    // it had committed just before the claim.
+    resolveFinalOwner: (transaction, ownerId) => forwardOwnerWrite(transaction, ownerId),
     onSessionCreated: async (transaction, meta): Promise<void> => {
       await store.registerSessionUrls(
         meta.id,
@@ -81,6 +100,30 @@ async function createAgentSessionStore(connectionString: string): Promise<PgAgen
       notifyDurableAgentEvent(transaction, { kind: 'session', sessionId }),
   });
   return store;
+}
+
+async function createAgentSessionStore(connectionString: string): Promise<PgAgentSessionStore> {
+  const { pool } = await getServerPersistenceProvider(connectionString);
+  await withSchemaBootstrapLock(pool as unknown as ConnectableQueryable, ensureAgentSessionSchema);
+  return sessionStore(pool, nodePostgresTransaction(pool));
+}
+
+/**
+ * Keep a checked-out connection through claim admission and late-claim cleanup.
+ * pool.end() waits for this connection; cleanup never needs to borrow from an
+ * already ending pool. The callback hands normal work off without awaiting it.
+ */
+export async function withAgentSessionClaim<T>(
+  operation: (store: PgAgentSessionStore) => Promise<T>,
+): Promise<T> {
+  await getAgentSessionStore();
+  const { pool } = await getServerPersistenceProvider(process.env.DATABASE_URL ?? '');
+  const client = await pool.connect();
+  try {
+    return await operation(sessionStore(client, (body) => transactionOn(client, body)));
+  } finally {
+    client.release();
+  }
 }
 
 /**

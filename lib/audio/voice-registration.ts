@@ -18,9 +18,23 @@ export interface VoiceRegistrationConfig {
   baseUrl: string;
   apiKey?: string;
   model?: string;
+  /**
+   * `true` pins a client-supplied BYOK `baseUrl` to the strict public policy;
+   * unset falls back to the process-wide `ALLOW_LOCAL_NETWORKS` behavior.
+   */
+  publicOnly?: boolean;
+  /**
+   * `true` for a server-configured provider: its `baseUrl` may be on a local
+   * network without ALLOW_LOCAL_NETWORKS.
+   */
+  managed?: boolean;
 }
 
 export interface VoiceRegistrationAdapter {
+  /** Provider wire name used for enrollment identity; omitted adapters send the name unchanged. */
+  normalizeRegistrationName?(name: string): string;
+  /** Minimum reference duration in seconds; omitted adapters use the shared minimum. */
+  minReferenceDurationSeconds?: number;
   /** Whether registration is available for this provider given its options (e.g. backend kind). */
   supportsRegistration(options?: Record<string, unknown>): boolean;
   /** Whether the adapter can synthesize its own reference clip from a voice design. */
@@ -32,6 +46,14 @@ export interface VoiceRegistrationAdapter {
    * whether (and how) to honor it. `undefined` when registration is model-less.
    */
   resolveRegistrationModel(clientModel?: string): string | undefined;
+  /** Local saved-voice preflight only: no network work or model authorization. */
+  assertVoiceCompatible?(voiceId: string, configuredVoices?: readonly { id: string }[]): void;
+  /**
+   * The target a saved voice must have been enrolled for, when the provider
+   * binds saved voices to one: a model id, safe to show clients. Settings use
+   * it to mark saved voices that need cloning again before anything is played.
+   */
+  cloneTarget?(): string;
   /** Whether `voiceId` is registered, or `unknown` when the lookup is inconclusive. */
   voiceExists(
     cfg: VoiceRegistrationConfig,

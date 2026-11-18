@@ -1,3 +1,4 @@
+import { setDeploymentConfigForTests } from '@/lib/server/model-config/runtime';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { TTSRequestTimeoutError } from '@/lib/audio/tts-providers';
@@ -9,13 +10,25 @@ import type { Scene } from '@/lib/types/stage';
 const mocks = vi.hoisted(() => ({
   providers: vi.fn(),
   persist: vi.fn(),
+  fetch: vi.fn(),
 }));
 
-vi.mock('@/lib/server/provider-config', () => ({
-  getServerTTSProviders: mocks.providers,
-  resolveTTSApiKey: () => 'sk-test',
-  resolveTTSBaseUrl: () => 'https://gw.example.com/v1',
+// The provider adapters now issue requests through undici's fetch (with a
+// pinned dispatcher) rather than the Next-patched global, so the hung transport
+// stands in for undici.
+vi.mock('undici', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('undici')>();
+  return { ...actual, fetch: mocks.fetch };
+});
+
+vi.mock('@/lib/server/provider-config', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/server/provider-config')>()),
   resolveTTSModel: () => '',
+}));
+// The tts slot resolves to a managed OpenAI TTS provider at a gateway.
+vi.mock('@/lib/server/model-config/media', async (original) => ({
+  ...(await original<typeof import('@/lib/server/model-config/media')>()),
+  serverMediaConnection: async () => mocks.providers(),
 }));
 
 vi.mock('@/lib/server/classroom-media-bytes', () => ({
@@ -40,7 +53,7 @@ const scene = {
  * underlying request was actually aborted.
  */
 function hungTransport(captured: AbortSignal[]) {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+  mocks.fetch.mockImplementation(async (_input, init) => {
     const signal = (init as RequestInit | undefined)?.signal;
     if (signal) captured.push(signal);
     return new Promise<Response>((_resolve, reject) => {
@@ -48,6 +61,7 @@ function hungTransport(captured: AbortSignal[]) {
       else signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
   });
+  return mocks.fetch;
 }
 
 function makeStore(doc: CourseDocument | null): CourseStore {
@@ -67,9 +81,29 @@ function courseDoc(): CourseDocument {
 
 describe('TTS abort propagation and per-request timeout', () => {
   beforeEach(() => {
+    setDeploymentConfigForTests({
+      layer: {
+        source: 'deployment',
+        config: {
+          providers: {
+            'openai-tts': { preset: 'openai-tts', apiKey: 'sk-test', models: ['gpt-4o-mini-tts'] },
+          },
+        },
+      },
+      legacy: false,
+      notices: [],
+    });
     mocks.providers.mockReset();
     mocks.persist.mockReset();
-    mocks.providers.mockReturnValue({ 'openai-tts': { disabled: false } });
+    mocks.fetch.mockReset();
+    mocks.providers.mockReturnValue({
+      providerId: 'openai-tts',
+      apiKey: 'sk-test',
+      baseUrl: 'https://gw.example.com/v1',
+      managed: true,
+      userEndpoint: false,
+      origin: 'configuration',
+    });
     mocks.persist.mockResolvedValue('https://openmaic.test/audio.mp3');
   });
 
@@ -81,18 +115,19 @@ describe('TTS abort propagation and per-request timeout', () => {
     const previous = process.env.TTS_REQUEST_TIMEOUT_MS;
     process.env.TTS_REQUEST_TIMEOUT_MS = '80';
     const captured: AbortSignal[] = [];
-    const transport = hungTransport(captured);
+    hungTransport(captured);
     try {
       const error = await synthesizeSceneNarration({
         scene: structuredClone(scene),
         force: false,
       }).catch((err: unknown) => err);
 
-      // The hung provider fails the tool call with a clear retryable error
-      // instead of wedging the session.
+      // The hung provider fails the tool call with a clear timeout error
+      // advising against blind retries instead of wedging the session.
       expect(error).toBeInstanceOf(TTSRequestTimeoutError);
       expect(String(error)).toContain('timed out');
-      expect(String(error)).toContain('Retry the tool call');
+      expect(String(error)).not.toContain('Retry the tool call');
+      expect(String(error)).toContain('TTS_REQUEST_TIMEOUT_MS');
       expect(mocks.persist).not.toHaveBeenCalled();
       // The underlying request was aborted by the timeout bound.
       expect(captured).toHaveLength(1);
@@ -100,13 +135,13 @@ describe('TTS abort propagation and per-request timeout', () => {
     } finally {
       if (previous === undefined) delete process.env.TTS_REQUEST_TIMEOUT_MS;
       else process.env.TTS_REQUEST_TIMEOUT_MS = previous;
-      transport.mockRestore();
+      mocks.fetch.mockReset();
     }
   });
 
   it('aborts the in-flight provider request and rejects when the caller signal aborts', async () => {
     const captured: AbortSignal[] = [];
-    const transport = hungTransport(captured);
+    hungTransport(captured);
     const controller = new AbortController();
 
     const promise = synthesizeSceneNarration({
@@ -122,12 +157,12 @@ describe('TTS abort propagation and per-request timeout', () => {
     await expect(promise).rejects.toThrow(/aborted/i);
     expect(captured[0]?.aborted).toBe(true);
     expect(mocks.persist).not.toHaveBeenCalled();
-    transport.mockRestore();
+    mocks.fetch.mockReset();
   });
 
   it('generate_tts returns the interrupted shape when cancelled mid-synthesis', async () => {
     const captured: AbortSignal[] = [];
-    const transport = hungTransport(captured);
+    hungTransport(captured);
     const store = makeStore(courseDoc());
     const tools = buildCourseAudioAndDeckTools({
       store,
@@ -151,6 +186,6 @@ describe('TTS abort propagation and per-request timeout', () => {
     // persists as "This tool call was interrupted".
     await expect(promise).rejects.toThrow(/aborted/i);
     expect(captured[0]?.aborted).toBe(true);
-    transport.mockRestore();
+    mocks.fetch.mockReset();
   });
 });

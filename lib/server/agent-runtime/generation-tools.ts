@@ -25,15 +25,23 @@ import type { CourseToolDeps } from './course-tools';
 import { runStageMutation } from './mutation-fence';
 import { shiftCourseOrders } from './course-edit/tools';
 import { createGenerationAiCallFactory, sceneContentStage } from './generation-ai-call';
-import { synthesizeSceneNarration } from './scene-tts';
+import {
+  describeNarrationVoice,
+  formatTtsFailureTally,
+  synthesizeSceneNarration,
+} from './scene-tts';
 import { toGenerationContent } from './generation-content';
 import { checkScenesAgainstSkill } from './skills';
+import { mayNameAPoolAsset } from '@/lib/media/media-placeholder';
 import { isMediaPlaceholder } from '@/lib/store/media-generation';
 import { createLogger } from '@/lib/logger';
 
 const MAX_GENERATE_SCENE_MEDIA = 8;
 const SUPPORTED_SCENE_TYPES = new Set(['slide', 'quiz', 'interactive', 'pbl']);
 const log = createLogger('AgentGenerationTools');
+
+export const SLIDE_DESIGN_DESCRIPTION =
+  'Slide pages only: the designer brief for how this page looks, written the way a designer hands a layout to a production artist. Say (1) what the page must make obvious at a glance; (2) the visual style: background, palette with its roles (title, accent, panels), tone and density; (3) the layout: the regions with rough proportions (for example a title band across the top 15%, then a 60/40 split) and which piece of content sits in each region and in what form (table, numbered steps, cards, diagram, chart, formula, image). Refer to the content by role ("the comparison table", "the three steps"); do not restate it: the words on the page come from brief and materialFacts, and this text is never written onto the page. Write it for every slide you generate; leave it out only to let the generator design the page freely.';
 
 const SceneParams = Type.Object({
   stageId: Type.String({ description: COURSE_STAGE_ID_DESCRIPTION }),
@@ -60,15 +68,35 @@ const SceneParams = Type.Object({
       },
     ),
   ),
+  // Open object (not Type.Unknown) so the model-facing schema says `type: object`.
+  // No Type.Record (emits patternProperties) and no `additionalProperties: true`
+  // (Google's converter then keeps an empty `properties`, which Gemini rejects).
   widgetOutline: Type.Optional(
-    Type.Unknown({
+    Type.Object(
+      {},
+      {
+        description:
+          'Interactive pages only: widget configuration object matching widgetType (e.g. { concept, keyVariables } for simulation, { diagramType, nodes } for diagram, { language } for code, { gameType, challenge } for game, { visualizationType, objects } for visualization3d). Must be a plain object. Defaults to { concept: title } when widgetType is set; when only widgetOutline is set, widgetType defaults to simulation.',
+      },
+    ),
+  ),
+  brief: Type.String({
+    minLength: 1,
+    description:
+      'The teaching intent of this one page: what the learner should take away and how the page gets there. The generator reads it as the page description and may turn its wording into page text, so it carries content intent only, not layout, styling or narration-delivery rules (for a slide, the look goes in design). For pbl, the project description.',
+  }),
+  instruction: Type.Optional(Type.String()),
+  materialFacts: Type.Optional(
+    Type.Array(Type.String(), {
       description:
-        'Interactive pages only: widget configuration object matching widgetType (e.g. { concept, keyVariables } for simulation, { diagramType, nodes } for diagram, { language } for code, { gameType, challenge } for game, { visualizationType, objects } for visualization3d). Must be a plain object. Defaults to { concept: title } when widgetType is set; when only widgetOutline is set, widgetType defaults to simulation.',
+        'The content points the page must present; the generator writes each of them onto the page. Only content meant for learners belongs here; style and layout go in design, and narration constraints do not belong here. For pbl, the target skills.',
     }),
   ),
-  brief: Type.String({ minLength: 1 }),
-  instruction: Type.Optional(Type.String()),
-  materialFacts: Type.Optional(Type.Array(Type.String())),
+  design: Type.Optional(
+    Type.String({
+      description: SLIDE_DESIGN_DESCRIPTION,
+    }),
+  ),
   media: Type.Optional(
     Type.Array(
       Type.Object({
@@ -77,7 +105,11 @@ const SceneParams = Type.Object({
         width: Type.Optional(Type.Number({ minimum: 1 })),
         height: Type.Optional(Type.Number({ minimum: 1 })),
       }),
-      { maxItems: 8 },
+      {
+        maxItems: 8,
+        description:
+          'Images this page must show. src is a use_material_media or generate_image id (ast_...), an HTTP(S) URL, or a same-origin path. description says what the figure shows and what the learner should read from it. Give width/height from the material listing when known.',
+      },
     ),
   ),
 });
@@ -153,10 +185,40 @@ function concreteMediaSrc(src: string): boolean {
   }
 }
 
+/**
+ * A media src this tool will pass through onto a page element.
+ *
+ * An allocated asset id counts, alongside an HTTP(S) URL and a same-origin
+ * path. `generate_image` returns an id now that it stores its bytes in the
+ * asset pool (#1522), and the documented flow hands that src straight to
+ * `generate_scene.media`; the generation package writes a mapping value onto
+ * the element verbatim (`resolveImageIds`) and the renderer leases the id from
+ * the pool, so it needs no other treatment here. `isMediaPlaceholder` still
+ * answers true for it — an id does need resolving before it renders — which is
+ * why the id is admitted ahead of that question rather than by changing what
+ * it means. What stays refused is what was always refused: a generation
+ * placeholder, a data URL, and anything naming nothing.
+ */
+function acceptableMediaSrc(src: string): boolean {
+  if (mayNameAPoolAsset(src)) return !/\s/.test(src);
+  return !isMediaPlaceholder(src) && concreteMediaSrc(src);
+}
+
 export interface UnresolvedMediaPlaceholder {
   elementId: string;
   type: 'image' | 'video';
   placeholder: string;
+}
+
+/**
+ * Whether a document reference would still render as a skeleton.
+ *
+ * An allocated asset id would not: its bytes are in the pool and the renderer
+ * leases them. Only a reference nothing can resolve — a generation placeholder
+ * waiting on a job — is a skeleton.
+ */
+function unresolvedRef(ref: string): boolean {
+  return isMediaPlaceholder(ref) && !mayNameAPoolAsset(ref);
 }
 
 /** Find slide media elements that would still render as skeletons. */
@@ -171,7 +233,7 @@ export function collectUnresolvedMediaPlaceholders(scene: Scene): UnresolvedMedi
       mediaRef?: string;
     };
     if (!candidate.id) continue;
-    if (candidate.type === 'image' && candidate.src && isMediaPlaceholder(candidate.src)) {
+    if (candidate.type === 'image' && candidate.src && unresolvedRef(candidate.src)) {
       placeholders.push({
         elementId: candidate.id,
         type: 'image',
@@ -181,15 +243,15 @@ export function collectUnresolvedMediaPlaceholders(scene: Scene): UnresolvedMedi
     if (
       candidate.type === 'video' &&
       (!candidate.src ||
-        isMediaPlaceholder(candidate.src) ||
-        (candidate.mediaRef ? isMediaPlaceholder(candidate.mediaRef) : false))
+        unresolvedRef(candidate.src) ||
+        (candidate.mediaRef ? unresolvedRef(candidate.mediaRef) : false))
     ) {
       placeholders.push({
         elementId: candidate.id,
         type: 'video',
         placeholder:
-          (candidate.src && isMediaPlaceholder(candidate.src) ? candidate.src : undefined) ??
-          (candidate.mediaRef && isMediaPlaceholder(candidate.mediaRef)
+          (candidate.src && unresolvedRef(candidate.src) ? candidate.src : undefined) ??
+          (candidate.mediaRef && unresolvedRef(candidate.mediaRef)
             ? candidate.mediaRef
             : undefined) ??
           candidate.mediaRef ??
@@ -222,7 +284,10 @@ export function filterKnownActions(actions: readonly Action[]): Action[] {
 }
 
 export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never, never>[] {
-  const routed = createGenerationAiCallFactory({ abortSignal: deps.abortSignal });
+  const routed = createGenerationAiCallFactory({
+    abortSignal: deps.abortSignal,
+    ownerId: deps.ownerId,
+  });
   const aiCallFor = (stage: Parameters<typeof routed>[0]) => deps.aiCall ?? routed(stage);
   const actionGenerator = deps.generateActions ?? generateSceneActions;
 
@@ -230,7 +295,7 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
     name: 'generate_scene',
     label: 'Generate page',
     description:
-      'Generate and durably persist one page from an explicit title, type, and brief. Reusing an order replaces that page. Interactive pages accept widgetType (simulation/diagram/code/game/visualization3d) plus a matching widgetOutline object; both are rejected for other page types.',
+      'Generate and durably persist one page from an explicit title, type, and brief. Reusing an order replaces that page. Content and look are separate inputs: brief and materialFacts say what the page teaches; for a slide, design says how it looks (style and layout) and is rejected for other page types. Interactive pages accept widgetType (simulation/diagram/code/game/visualization3d) plus a matching widgetOutline object; both are rejected for other page types. To put a source figure, table image or generated image on the page, pass it in `media`: one { src, description, width, height } per image, where src is the id returned by use_material_media or generate_image. The content model places them; a page generated without `media` has no images.',
     parameters: SceneParams,
     async execute(_callId, params, signal) {
       if (!Number.isInteger(params.order) || params.order < 1) {
@@ -299,6 +364,14 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
           true,
         );
       }
+      const design = params.design?.trim();
+      if (params.design !== undefined && params.type !== 'slide') {
+        return result(
+          'generate_scene only accepts design for slide pages.',
+          { error: 'design-requires-slide', type: params.type },
+          true,
+        );
+      }
       const requestedMedia = params.media ?? [];
       if (requestedMedia.length > MAX_GENERATE_SCENE_MEDIA) {
         return result(
@@ -314,6 +387,7 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
         type: params.type,
         description: brief,
         keyPoints: params.materialFacts ?? [],
+        ...(design ? { design } : {}),
         ...(params.type === 'interactive' &&
         (params.widgetType !== undefined || params.widgetOutline !== undefined)
           ? {
@@ -358,9 +432,9 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
             true,
           );
         }
-        if (isMediaPlaceholder(src) || !concreteMediaSrc(src)) {
+        if (!acceptableMediaSrc(src)) {
           return result(
-            'Every media item needs a concrete HTTP(S) URL or same-origin path, not a placeholder or data URL.',
+            'Every media item needs a stored-asset id from generate_image, an HTTP(S) URL, or a same-origin path — not a generation placeholder or a data URL.',
             {
               error: isMediaPlaceholder(src) ? 'media-placeholder-src' : 'invalid-media-src',
               index,
@@ -555,6 +629,7 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
           force: false,
           roster: doc.stage.generatedAgentConfigs,
           signal,
+          ownerId: deps.ownerId,
         });
         if (audio.changed) {
           await runStageMutation(signal, () =>
@@ -569,7 +644,13 @@ export function buildGenerationTools(deps: GenerationToolDeps): AgentTool<never,
           });
         }
       }
-      return result(`Persisted ${actions.length} known actions for "${scene.title}".`, {
+      const voiceNote =
+        audio?.voice && audio.generated > 0 ? ` ${describeNarrationVoice(audio.voice)}` : '';
+      const narration =
+        audio?.available === true
+          ? ` Narration audio: ${audio.generated} generated, ${audio.skipped} skipped, ${formatTtsFailureTally(audio.failed)}.${voiceNote}`
+          : '';
+      return result(`Persisted ${actions.length} known actions for "${scene.title}".${narration}`, {
         sceneId: scene.id,
         actions,
         ...(audio ? { audio } : {}),

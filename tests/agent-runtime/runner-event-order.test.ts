@@ -12,7 +12,7 @@ vi.mock('@/lib/server/agent-runtime/store', () => ({
     clearCancel: vi.fn(async () => undefined),
     finishSession: mocks.finishSession,
     getSession: vi.fn(async () => null),
-    hasSessionRunHistory: vi.fn(async () => false),
+    readEventsAfter: vi.fn(async () => []),
     heartbeat: vi.fn(async () => true),
     getCancelRequestedAt: vi.fn(async () => null),
     isCancelRequested: vi.fn(async () => false),
@@ -30,6 +30,16 @@ vi.mock('@/lib/server/agent-runtime/session-materials', async (importActual) => 
   const actual =
     await importActual<typeof import('@/lib/server/agent-runtime/session-materials')>();
   return { ...actual, listSessionMaterials: vi.fn(async () => []) };
+});
+// The runner lists what the session reaches through the shared resolver;
+// links need a database these tests do not have.
+vi.mock('@/lib/server/agent-runtime/material-resolver', async (importActual) => {
+  const actual =
+    await importActual<typeof import('@/lib/server/agent-runtime/material-resolver')>();
+  return {
+    ...actual,
+    listSessionScopeMaterials: vi.fn(async () => []),
+  };
 });
 
 vi.mock('@/lib/server/agent-runtime/entry-tree-storage', async (importActual) => {

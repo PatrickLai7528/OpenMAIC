@@ -21,9 +21,16 @@ export type {
   SceneContentFailureCode,
   SceneContentOptions,
 } from './scene-generator.js';
+export { renderScenePrompt } from './scene-prompts.js';
+export type {
+  RenderedScenePrompt,
+  ScenePromptId,
+  SlideContentPromptOptions,
+} from './scene-prompts.js';
 export { buildCompleteScene } from './scene-builder.js';
 export type { BuildCompleteSceneOptions } from './scene-builder.js';
 export {
+  DEFAULT_MAX_DELAY_MS,
   isAbortError,
   isRetryableGenerationError,
   withGenerationRetry,
@@ -96,6 +103,7 @@ export {
   buildCourseContext,
   buildLanguageText,
   buildVisionUserContent,
+  parseBase64DataUrl,
   formatAgentsForPrompt,
   formatImageDescription,
   formatImagePlaceholder,
@@ -108,7 +116,18 @@ export type {
   SceneOutline,
   UserRequirements,
   WidgetOutline,
+  WidgetVariable,
   WidgetType,
 } from './outline-types.js';
 
 export * from './prompts/index.js';
+
+export {
+  rewriteInteractiveLibraries,
+  mapInteractiveLibraryUrl,
+} from './interactive-library-mapper.js';
+export {
+  INTERACTIVE_LIBRARIES,
+  interactiveLibraryPrompt,
+  interactiveLibraryUrl,
+} from './interactive-libraries.js';

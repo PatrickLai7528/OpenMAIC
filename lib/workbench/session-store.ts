@@ -22,11 +22,24 @@
  *    `lastEventId` instead of replaying the whole run.
  */
 import { create } from 'zustand';
+import i18n from 'i18next';
+import { supportedLocaleOf } from '@/lib/i18n/types';
+import { contextBudgetCopyKey } from '@/lib/agent/runtime/context-budget-error';
 import { isSkillLoadTool, skillLoadId } from './skill-load';
-import { defaultWorkbenchTranslator, type WorkbenchCopyKey } from '@/lib/i18n/workbench';
+import {
+  defaultWorkbenchTranslator,
+  type WorkbenchCopyKey,
+  type WorkbenchTranslator,
+} from '@/lib/i18n/workbench';
 import { parseElementRefs, type ElementRef } from './element-refs';
 import { parseCourseRefs, type CourseRef } from './course-refs';
 import { appendCourseSighting, courseSightingsOf } from './run-courses';
+import {
+  isWorkbenchMaterialMime,
+  MEDIA_MIME_TYPES,
+  resolveWorkbenchMaterialMime,
+} from './material-upload-policy';
+import { fetchMaterialPolicy, type MaterialPolicy } from '@/lib/generation-run-client/api';
 
 export type ChatNodeKind =
   | 'user'
@@ -91,6 +104,12 @@ export type SystemTone = 'info' | 'success' | 'error';
 export interface QuestionOption {
   id: string;
   label: string;
+  /**
+   * The agent's recommended choice, at most one per question. The answer form
+   * may auto-confirm it (`question-auto-confirm-state.ts`); absent on every
+   * envelope written before the field existed.
+   */
+  recommended?: true;
 }
 
 export interface ChatNode {
@@ -184,11 +203,19 @@ export interface ChatNode {
   toolTraces?: string[];
   /** Tool cards only: the scene this call produced, once its checkpoint lands. */
   sceneId?: string;
+  /** Tool cards only: the course that scene was written to, from the same checkpoint. */
+  sceneStageId?: string;
   /**
    * Question cards only: the choices the agent offered, or absent for an open
    * question (the composer below the card is the answer box).
    */
   questionOptions?: QuestionOption[];
+  /**
+   * Question cards only: supporting material the agent attached (a proposed
+   * plan), shown collapsed under the one-line question. Absent on older
+   * envelopes, whose whole text is in `text`.
+   */
+  questionDetails?: string;
   /** Question cards only: several options may be picked at once. */
   questionMultiSelect?: boolean;
   /**
@@ -197,6 +224,12 @@ export interface ChatNode {
    * see `answerOpenQuestions`.
    */
   questionAnswered?: boolean;
+  /**
+   * User, assistant and question nodes: the timestamp of the event that drew them. The
+   * request preview places the conversation's own moments (the request, the
+   * plan question, its answer) on the same clock as the tool cards.
+   */
+  at?: number;
 }
 
 export interface PlannedPage {
@@ -245,6 +278,22 @@ export type SessionStatus =
  */
 export const COURSE_NODE_KEY = 'course-deck';
 
+/**
+ * The attached run is writing this course right now: the run is live and the
+ * answer under way has written or linked the course (`runCourseStageIds`, which
+ * `agent_end` drains). A course the agent only read, or wrote in an earlier
+ * answer, is not being built.
+ */
+export function sessionBuildsCourse(
+  state: Pick<WorkbenchFold, 'status' | 'runCourseStageIds'>,
+  stageId: string | null | undefined,
+): boolean {
+  if (!stageId) return false;
+  const live =
+    state.status === 'connecting' || state.status === 'queued' || state.status === 'running';
+  return live && state.runCourseStageIds.includes(stageId);
+}
+
 /** The fold's half of the store: everything `foldEvent` may read or write. */
 export interface WorkbenchFold {
   status: SessionStatus;
@@ -280,6 +329,15 @@ export interface WorkbenchFold {
    * diff would be state that can go stale in a way the list cannot.
    */
   libraryRevision: number;
+  /**
+   * The same counter for the owner's MATERIAL library: bumped by a
+   * `library_changed` whose `library` is `materials` (a folder created or
+   * renamed, materials moved or renamed, an extraction started or settled).
+   * What lists materials -- the composer's picker and `@` -- refetches on an
+   * increase. Course writes never bump it, and material writes never bump
+   * `libraryRevision`, so neither list refetches for the other's changes.
+   */
+  materialLibraryRevision: number;
   /**
    * Stage ids seen in `stage_link` events (legacy `course_link` accepted on
    * replay), in first-seen order. The workspace records how many came from the
@@ -398,6 +456,13 @@ export interface WorkbenchSessionState extends WorkbenchFold {
   sessionId: string | null;
   attached: boolean;
   /**
+   * Whether the conversation was started beside an existing course: the
+   * session's durable `existingCourse` flag, from the sessions list or the
+   * detail read. Null until one of them has answered. Session metadata, not
+   * transcript data: the fold never writes it.
+   */
+  existingCourse: boolean | null;
+  /**
    * Changes whenever this client makes a title decision. A detail request
    * captures it so an older response cannot overwrite a rename (including an
    * explicit clear) made while that request was in flight.
@@ -428,9 +493,10 @@ export interface WorkbenchState extends WorkbenchSessionState {
    * Attach to a session. `stageId` is the session's own stage when the caller
    * already knows it (the sessions list, the creation response); a deep link
    * that carries only `?session=` passes null and the meta fetch in
-   * `useWorkbenchStream` fills it.
+   * `useWorkbenchStream` fills it. `existingCourse` likewise: the session's
+   * flag when the caller has its row, null when it does not know it yet.
    */
-  attach: (sessionId: string, stageId: string | null) => void;
+  attach: (sessionId: string, stageId: string | null, existingCourse?: boolean | null) => void;
   /**
    * Hold NO session: the authoritative reset. See `createInitialSessionState`.
    */
@@ -463,6 +529,7 @@ export interface WorkbenchState extends WorkbenchSessionState {
     expectedTitleRevision?: number;
     status?: SessionStatus;
     stageId?: string | null;
+    existingCourse?: boolean;
   }) => void;
 }
 
@@ -512,6 +579,7 @@ export function createInitialSessionState(): WorkbenchSessionState {
     // ── Attachment ──────────────────────────────────────────────────────
     sessionId: null,
     attached: false,
+    existingCourse: null,
     sessionTitleRevision: 0,
     // Nothing is attached, so there is nothing to replay. It used to be `true`
     // here, which is only ever read as "keep the catch-up spinner up" — and with
@@ -541,6 +609,7 @@ export function createInitialSessionState(): WorkbenchSessionState {
     pages: {},
     chat: [],
     libraryRevision: 0,
+    materialLibraryRevision: 0,
     stageLinkStageIds: [],
     touchedStageIds: [],
     runCourseStageIds: [],
@@ -784,11 +853,12 @@ function answerOpenQuestions(chat: ChatNode[], answerText: unknown): ChatNode[] 
 function questionOptionsOf(value: unknown): QuestionOption[] {
   if (!Array.isArray(value)) return [];
   return (value as unknown[])
-    .map((raw) => {
-      const option = raw as { id?: unknown; label?: unknown } | null;
+    .map((raw): QuestionOption => {
+      const option = raw as { id?: unknown; label?: unknown; recommended?: unknown } | null;
       return {
         id: String(option?.id ?? '').trim(),
         label: String(option?.label ?? '').trim(),
+        ...(option?.recommended === true ? { recommended: true as const } : {}),
       };
     })
     .filter((option) => option.id && option.label);
@@ -988,6 +1058,7 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
             key: `${key}-u`,
             kind: 'user',
             text: startPrompt,
+            at: event.ts,
             ...(startCourseRefs.length ? { courseRefs: startCourseRefs } : {}),
           },
         ];
@@ -1052,6 +1123,12 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
       openWaiting(next, `${key}-w`, event.ts);
       break;
     }
+    case 'skill_detached': {
+      // Recovery is an internal state repair, not a new chat message. Keep the
+      // historical Skill loads intact without exposing the frozen binding.
+      next.skillId = null;
+      break;
+    }
     case 'session_interrupted': {
       // PR1: the runner parked the job WITHOUT a terminal status (deploy
       // handoff / lease lost). The row stays `running`; another instance will
@@ -1114,6 +1191,7 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
           key,
           kind: 'user',
           text: messageText,
+          at: event.ts,
           ...(attachments.length ? { materials: attachments } : {}),
           ...(elementRefs.length ? { elementRefs } : {}),
           ...(courseRefs.length ? { courseRefs } : {}),
@@ -1161,7 +1239,11 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
         key,
         kind: 'question',
         text: question,
+        at: event.ts,
         ...(options.length > 0 ? { questionOptions: options } : {}),
+        ...(typeof data.details === 'string' && data.details.trim()
+          ? { questionDetails: data.details.trim() }
+          : {}),
         // Multi-select only means something when there is a set to pick from.
         ...(data.multiSelect && options.length > 0 ? { questionMultiSelect: true } : {}),
       };
@@ -1290,7 +1372,7 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
           // `message_start`, `session_end` — are the fallback for a run that
           // ends before its own marker lands. All of them replay, so the
           // duration converges (OpenPBL: a part's completion is durable).
-          chat = [...chat, { key, kind: 'assistant', text, streaming: true }];
+          chat = [...chat, { key, kind: 'assistant', text, streaming: true, at: event.ts }];
           next.assistantKey = key;
         }
       }
@@ -1417,7 +1499,7 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
           ? chat.map((n, i) => (i === streamIdx ? { ...n, text, streaming: false } : n))
           : chat.filter((_, i) => i !== streamIdx);
       } else if (text && canCreate) {
-        chat = [...chat, { key, kind: 'assistant', text }];
+        chat = [...chat, { key, kind: 'assistant', text, at: event.ts }];
       }
       next.chat = chat;
       next.thinkingKey = null;
@@ -1553,12 +1635,16 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
         // the chat's tool cards carry a real page reference.
         const sceneId = data.sceneId as string | undefined;
         if (sceneId) {
+          const sceneStageId =
+            typeof data.stageId === 'string' && data.stageId ? data.stageId : undefined;
           const lastRunningIdx = [...next.chat]
             .reverse()
             .findIndex((n) => n.kind === 'tool' && n.toolState === 'running');
           if (lastRunningIdx >= 0) {
             const idx = next.chat.length - 1 - lastRunningIdx;
-            next.chat = next.chat.map((n, i) => (i === idx ? { ...n, sceneId } : n));
+            next.chat = next.chat.map((n, i) =>
+              i === idx ? { ...n, sceneId, ...(sceneStageId ? { sceneStageId } : {}) } : n,
+            );
           }
         }
       }
@@ -1600,6 +1686,12 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
       break;
     }
     case 'library_changed': {
+      // A material-library write is not a course-library write: it bumps its
+      // own counter and stops here (it names no stage to sight).
+      if (data.library === 'materials') {
+        next.materialLibraryRevision = state.materialLibraryRevision + 1;
+        break;
+      }
       // A stage or folder write landed. The workspace's tree cannot know from
       // here WHAT it should look like — only that what it is showing predates a
       // write — so the fold counts the write and the shell refetches the
@@ -1663,17 +1755,25 @@ export function foldEvent(state: WorkbenchFold, event: WorkbenchEvent): Workbenc
         // sentence, which read as a log line and — because every auto-retry
         // appends its own marker — stacked N identical copies of it.
         const cause = data.error ? String(data.error).trim() : '';
+        // A context-budget block is final for this conversation: say so in
+        // plain words and point to a new chat, not to a retry that would hit
+        // the same limit.
+        const budgetCopyKey = contextBudgetCopyKey(cause);
         next.chat = [
           ...settled,
           {
             key,
             kind: 'system',
             tone: 'error',
-            text: defaultWorkbenchTranslator('workbench.system.runFailed'),
-            copyKey: 'workbench.system.runFailed',
-            hint: defaultWorkbenchTranslator('workbench.system.retryHint'),
-            hintCopyKey: 'workbench.system.retryHint',
-            ...(cause ? { detail: cause } : {}),
+            text: defaultWorkbenchTranslator(budgetCopyKey ?? 'workbench.system.runFailed'),
+            copyKey: budgetCopyKey ?? 'workbench.system.runFailed',
+            ...(!budgetCopyKey
+              ? {
+                  hint: defaultWorkbenchTranslator('workbench.system.retryHint'),
+                  hintCopyKey: 'workbench.system.retryHint',
+                  ...(cause ? { detail: cause } : {}),
+                }
+              : {}),
           },
         ];
         break;
@@ -1824,7 +1924,7 @@ export function appendCompactedReplayEvent(events: WorkbenchEvent[], event: Work
 export const useWorkbenchStore = create<WorkbenchState>((set) => ({
   ...createInitialSessionState(),
 
-  attach: (sessionId, stageId) =>
+  attach: (sessionId, stageId, existingCourse = null) =>
     set((state) =>
       // Re-attaching to the SAME session keeps the fold (that is the whole
       // point of unmounting the chat and coming back). A different session
@@ -1834,7 +1934,11 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
       // none": the deep-link path attaches without one and the meta fetch
       // fills it, so a later re-attach must not erase what was learned.
       state.sessionId === sessionId
-        ? { sessionId, stageId: stageId ?? state.stageId }
+        ? {
+            sessionId,
+            stageId: stageId ?? state.stageId,
+            existingCourse: existingCourse ?? state.existingCourse,
+          }
         : {
             ...createInitialSessionState(),
             sessionId,
@@ -1848,6 +1952,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
             // `stageId` AFTER the initial state on purpose: that carries the
             // fold's `stageId: null`, and the caller's stage is the fact here.
             stageId,
+            existingCourse,
           },
     ),
 
@@ -1895,6 +2000,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set) => ({
       // first-hand when it has it, and a late meta response for a session the
       // user has already switched away from must not repoint the course sync.
       ...(input.stageId && !state.stageId ? { stageId: input.stageId } : {}),
+      // An immutable fact of the session, so any answer is the answer.
+      ...(input.existingCourse !== undefined ? { existingCourse: input.existingCourse } : {}),
     })),
 
   applyEvent: (event) => set((state) => foldEvent(state, event)),
@@ -1955,6 +2062,7 @@ export async function createWorkbenchSession(input: {
       ...(input.materials?.length
         ? { materialIds: input.materials.map((material) => material.materialId) }
         : {}),
+      ...interfaceLocale(),
     }),
   });
   const body = (await res.json().catch(() => ({}))) as {
@@ -2067,6 +2175,16 @@ export function recoverTerminalCancelStatus(sessionId: string, error: unknown): 
 }
 
 /**
+ * The interface language a request is sent from, for the run's material
+ * wording (#1880): the shared i18next instance's current language when it is
+ * a supported one; otherwise nothing is sent and the server falls back.
+ */
+function interfaceLocale(): { locale?: string } {
+  const locale = supportedLocaleOf(i18n.language);
+  return locale ? { locale } : {};
+}
+
+/**
  * Send a follow-up into a live conversation. The server decides the delivery
  * shape (steer into a live run, or queue a new run on an idle session); the
  * event stream carries the bubble and whatever the agent does next, so there
@@ -2096,6 +2214,7 @@ export async function postWorkbenchMessage(
         : {}),
       ...(elementRefs.length ? { elementRefs } : {}),
       ...(courseRefs.length ? { courseRefs } : {}),
+      ...interfaceLocale(),
     }),
   });
   if (!res.ok) {
@@ -2121,30 +2240,205 @@ export interface WorkbenchMaterial {
   extractionStatus?: 'idle' | 'pending' | 'running' | 'done' | 'failed';
 }
 
+/**
+ * Display mebibytes for a byte cap. One fractional digit, rounded down, with
+ * the caller's decimal separator. A positive cap below 0.1 MiB, or a runtime
+ * that will not floor, returns undefined so the caller can use the generic
+ * message instead of showing 0 or an overstated limit.
+ */
+function formatMaterialUploadLimit(
+  maxBytes: number | undefined,
+  locale: string,
+): string | undefined {
+  if (typeof maxBytes !== 'number' || !Number.isFinite(maxBytes) || maxBytes <= 0) return undefined;
+  const limit = maxBytes / (1024 * 1024);
+  if (limit < 0.1) return undefined;
+  try {
+    const formatter = new Intl.NumberFormat(locale, {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 1,
+      roundingMode: 'floor',
+      useGrouping: false,
+      numberingSystem: 'latn',
+    });
+    if (formatter.resolvedOptions().roundingMode !== 'floor') return undefined;
+    return formatter.format(limit);
+  } catch {
+    return undefined;
+  }
+}
+
 export class WorkbenchMaterialUploadError extends Error {
   constructor(
     message: string,
     readonly status: number,
     readonly requestId?: string,
+    readonly maxBytes?: number,
   ) {
     super(message);
     this.name = 'WorkbenchMaterialUploadError';
   }
+
+  userMessage(t: WorkbenchTranslator, locale: string): string {
+    if (this.status === 415) return t('workbench.material.unsupportedType');
+    if (this.status === 429) return t('workbench.material.quotaExceeded');
+    // The owner's asset pool is full (`ASSET_QUOTA_EXCEEDED`): not the
+    // per-owner material limits of a 429.
+    if (this.status === 507) return t('workbench.material.storageFull');
+    if (this.status !== 413) return this.message;
+    const limit = formatMaterialUploadLimit(this.maxBytes, locale);
+    return limit === undefined
+      ? t('workbench.material.fileTooLarge')
+      : t('workbench.material.fileTooLargeWithLimit', { limit });
+  }
 }
 
-/** Upload one file into the caller's durable material library. */
-export async function uploadWorkbenchMaterial(file: File): Promise<WorkbenchMaterial> {
-  const res = await fetch('/api/materials', {
+// Share discovery across concurrent uploads for this page. Only the server's
+// advertised caps are authoritative; a failed or slow read must not block
+// uploading (the server's 413 still applies), and the next upload should try
+// discovery again. A slow read stays cached so later uploads can use it once
+// it answers; until then, uploads after its first timeout do not wait again.
+const MATERIAL_POLICY_WAIT_MS = 5_000;
+let materialPolicyPromise: Promise<MaterialPolicy | undefined> | undefined;
+let materialPolicyOverdue = false;
+let materialPolicyAnswered = false;
+
+async function workbenchMaterialPolicy(): Promise<MaterialPolicy | undefined> {
+  if (!materialPolicyPromise) {
+    materialPolicyOverdue = false;
+    materialPolicyAnswered = false;
+    materialPolicyPromise = fetchMaterialPolicy().then(
+      (policy) => {
+        materialPolicyAnswered = true;
+        return policy;
+      },
+      () => {
+        materialPolicyPromise = undefined;
+        return undefined;
+      },
+    );
+  }
+  if (materialPolicyOverdue && !materialPolicyAnswered) return undefined;
+  const timedOut = Symbol('timed out');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const policy = await Promise.race([
+      materialPolicyPromise,
+      new Promise<typeof timedOut>((resolve) => {
+        timer = setTimeout(resolve, MATERIAL_POLICY_WAIT_MS, timedOut);
+      }),
+    ]);
+    if (policy !== timedOut) return policy;
+    materialPolicyOverdue = true;
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** A finished `POST /api/materials`: its status, request id and parsed body. */
+interface MaterialPostAnswer {
+  readonly ok: boolean;
+  readonly status: number;
+  readonly requestId?: string;
+  readonly body: unknown;
+}
+
+/**
+ * Send the bytes. With `onProgress`, through XMLHttpRequest -- fetch reports
+ * no upload progress -- calling it with the share of the bytes sent (0 to 1).
+ */
+function postMaterialBytes(
+  file: File,
+  headers: Record<string, string>,
+  onProgress?: (sent: number) => void,
+): Promise<MaterialPostAnswer> {
+  const url = '/api/materials?scope=library';
+  if (onProgress && typeof XMLHttpRequest !== 'undefined') {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && event.total > 0) onProgress(event.loaded / event.total);
+      };
+      xhr.onload = () => {
+        let body: unknown = {};
+        try {
+          body = JSON.parse(xhr.responseText);
+        } catch {
+          body = {};
+        }
+        resolve({
+          ok: xhr.status >= 200 && xhr.status < 300,
+          status: xhr.status,
+          requestId: xhr.getResponseHeader('x-request-id') ?? undefined,
+          body,
+        });
+      };
+      xhr.onerror = () => reject(new TypeError('Failed to upload the material'));
+      xhr.send(file);
+    });
+  }
+  return fetch(url, {
     method: 'POST',
-    headers: {
-      'content-type': file.type || 'application/octet-stream',
-      'x-material-filename': encodeURIComponent(file.name),
-    },
+    headers,
     body: file,
     // Required by undici for streaming bodies; harmless otherwise.
     duplex: 'half',
-  } as RequestInit);
-  const body = (await res.json().catch(() => ({}))) as {
+  } as RequestInit).then(async (res) => ({
+    ok: res.ok,
+    status: res.status,
+    requestId: res.headers.get('x-request-id') ?? undefined,
+    body: await res.json().catch(() => ({})),
+  }));
+}
+
+/**
+ * Upload one file into the caller's durable material library. `onProgress`
+ * hears the share of its bytes sent, 0 to 1.
+ */
+export async function uploadWorkbenchMaterial(
+  file: File,
+  { onProgress }: { onProgress?: (sent: number) => void } = {},
+): Promise<WorkbenchMaterial> {
+  // Some Linux browsers report every OOXML file with the generic
+  // `application/vnd.ms-office` MIME (#1497) — resolve the concrete type
+  // from the filename so the server gate sees what the file actually is.
+  const mimeType = resolveWorkbenchMaterialMime({
+    mimeType: file.type,
+    fileName: file.name,
+  });
+  // The route rejects an unsupported type (415) before it applies a size cap;
+  // leave those to it so the user is told the format, not the size, is wrong.
+  const policy = isWorkbenchMaterialMime(mimeType) ? await workbenchMaterialPolicy() : undefined;
+  const maxBytes = MEDIA_MIME_TYPES.includes(mimeType)
+    ? policy?.maxMediaBytes
+    : policy?.maxDocumentBytes;
+  if (
+    typeof maxBytes === 'number' &&
+    Number.isFinite(maxBytes) &&
+    maxBytes > 0 &&
+    file.size > maxBytes
+  ) {
+    throw new WorkbenchMaterialUploadError(
+      `upload exceeds ${maxBytes} bytes`,
+      413,
+      undefined,
+      maxBytes,
+    );
+  }
+  // A session extracts what it binds itself: the library's own extraction
+  // (for classic generation) is not started for it.
+  const res = await postMaterialBytes(
+    file,
+    {
+      'content-type': mimeType || 'application/octet-stream',
+      'x-material-filename': encodeURIComponent(file.name),
+    },
+    onProgress,
+  );
+  const body = (res.body ?? {}) as {
     materialId?: string;
     originalName?: string;
     bytes?: number;
@@ -2152,21 +2446,28 @@ export async function uploadWorkbenchMaterial(file: File): Promise<WorkbenchMate
     extraction?: { status?: WorkbenchMaterial['extractionStatus'] };
     error?: string;
     message?: string;
+    maxBytes?: unknown;
   };
   if (!res.ok || !body.materialId) {
-    const requestId = res.headers.get('x-request-id') ?? undefined;
+    const requestId = res.requestId;
     const message = body.message ?? body.error ?? `POST /api/materials -> ${res.status}`;
     throw new WorkbenchMaterialUploadError(
       requestId ? `${message} [requestId=${requestId}]` : message,
       res.status,
       requestId,
+      typeof body.maxBytes === 'number' && Number.isFinite(body.maxBytes) && body.maxBytes > 0
+        ? body.maxBytes
+        : undefined,
     );
   }
+  // Prefer the server's echo; fall back to the locally resolved MIME (never
+  // the raw browser value, which may be the generic Office container).
+  const recordMime = body.mime || mimeType || file.type;
   return {
     materialId: body.materialId,
     name: body.originalName ?? file.name,
     bytes: body.bytes ?? file.size,
-    ...(body.mime || file.type ? { mimeType: body.mime || file.type } : {}),
+    ...(recordMime ? { mimeType: recordMime } : {}),
     ...(body.extraction?.status ? { extractionStatus: body.extraction.status } : {}),
   };
 }

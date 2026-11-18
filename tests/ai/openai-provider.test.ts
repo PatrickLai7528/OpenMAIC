@@ -19,7 +19,7 @@ vi.mock('@ai-sdk/azure', () => ({
   createAzure: azureMock.createAzure,
 }));
 
-import { getModel, getModelInfo, getProvider } from '@/lib/ai/providers';
+import { getModel, getModelInfo, getProvider, LLM_FETCH_TIMEOUT_MS } from '@/lib/ai/providers';
 import { normalizeAzureBaseUrl } from '@/lib/ai/azure';
 import type { ProviderId } from '@/lib/types/provider';
 
@@ -28,6 +28,7 @@ async function captureInjectedRequestBody(
   modelId: string,
   thinkingConfig?: Record<string, unknown>,
   baseUrl?: string,
+  request: { providerType?: 'openai'; messages?: Array<Record<string, unknown>> } = {},
 ) {
   const originalFetch = globalThis.fetch;
   const globalRecord = globalThis as Record<string, unknown>;
@@ -50,6 +51,7 @@ async function captureInjectedRequestBody(
       modelId,
       apiKey: 'sk-test',
       baseUrl,
+      providerType: request.providerType,
     });
 
     const lastCall = openAiMock.createOpenAI.mock.calls.at(-1);
@@ -59,7 +61,7 @@ async function captureInjectedRequestBody(
       method: 'POST',
       body: JSON.stringify({
         model: modelId,
-        messages: [{ role: 'user', content: 'hi' }],
+        messages: request.messages ?? [{ role: 'user', content: 'hi' }],
       }),
     });
 
@@ -183,7 +185,10 @@ describe('OpenAI provider defaults', () => {
     const options = openAiMock.createOpenAI.mock.calls.at(-1)?.[0] as
       | { fetch?: typeof fetch }
       | undefined;
-    expect(options?.fetch).toBeUndefined();
+    // Native transports always install the shared transport now (it carries
+    // the extended-timeout dispatcher); "no compat" is proven by the dialect
+    // assertions below.
+    expect(options?.fetch).toBeTypeOf('function');
     expect(openAiMock.responses).toHaveBeenCalledWith('gpt-5.6-sol');
     expect(openAiMock.chat).not.toHaveBeenCalled();
   });
@@ -223,7 +228,9 @@ describe('OpenAI provider defaults', () => {
     const options = openAiMock.createOpenAI.mock.calls.at(-1)?.[0] as
       | { fetch?: typeof fetch }
       | undefined;
-    expect(options?.fetch).toBeUndefined();
+    // See above: the shared transport is always installed; the dialect
+    // assertions prove the compat path was not taken.
+    expect(options?.fetch).toBeTypeOf('function');
     expect(openAiMock.responses).toHaveBeenCalledWith('gpt-5.6-sol');
     expect(openAiMock.chat).not.toHaveBeenCalled();
   });
@@ -401,6 +408,7 @@ describe('OpenAI provider defaults', () => {
     expect(azureMock.createAzure).toHaveBeenCalledWith({
       apiKey: 'azure-key',
       baseURL: 'https://test-resource.openai.azure.com/openai',
+      fetch: expect.any(Function),
     });
     expect(azureMock.model).toHaveBeenCalledWith('course-generation');
     expect(model).toEqual({
@@ -420,6 +428,7 @@ describe('OpenAI provider defaults', () => {
     expect(azureMock.createAzure).toHaveBeenCalledWith({
       apiKey: 'azure-key',
       baseURL: 'https://fast-ai-resource.services.ai.azure.com/openai/v1',
+      fetch: expect.any(Function),
     });
   });
 
@@ -440,6 +449,28 @@ describe('OpenAI provider defaults', () => {
   });
 
   it('includes latest official GLM and Kimi models', () => {
+    expect(getModelInfo('glm', 'glm-5.3')).toMatchObject({
+      id: 'glm-5.3',
+      name: 'GLM-5.3',
+      contextWindow: 1000000,
+      outputWindow: 128000,
+      capabilities: {
+        streaming: true,
+        tools: true,
+        vision: false,
+      },
+    });
+    expect(getModelInfo('glm', 'glm-5.3-flash')).toMatchObject({
+      id: 'glm-5.3-flash',
+      name: 'GLM-5.3-Flash',
+      contextWindow: 1000000,
+      outputWindow: 128000,
+      capabilities: {
+        streaming: true,
+        tools: true,
+        vision: true,
+      },
+    });
     expect(getModelInfo('glm', 'glm-5.2')).toMatchObject({
       id: 'glm-5.2',
       name: 'GLM-5.2',
@@ -564,6 +595,13 @@ describe('OpenAI provider defaults', () => {
   });
 
   it.each([
+    ['deepseek', 'deepseek-chat', { mode: 'disabled' }, { thinking: { type: 'disabled' } }],
+    [
+      'deepseek',
+      'deepseek-chat',
+      { mode: 'disabled', effort: 'low' },
+      { thinking: { type: 'disabled' } },
+    ],
     ['kimi', 'kimi-k3', { mode: 'enabled', effort: 'high' }, { reasoning_effort: 'high' }],
     ['grok', 'grok-4.6', { mode: 'enabled', effort: 'xhigh' }, { reasoning_effort: 'xhigh' }],
     ['grok', 'grok-4.5', { mode: 'enabled', effort: 'medium' }, { reasoning_effort: 'medium' }],
@@ -583,6 +621,26 @@ describe('OpenAI provider defaults', () => {
       { thinking: { type: 'enabled' }, reasoning_effort: 'xhigh' },
     ],
     ['glm', 'glm-5.2', { mode: 'disabled' }, { thinking: { type: 'disabled' } }],
+    [
+      'glm',
+      'glm-5.3',
+      { mode: 'enabled', effort: 'low' },
+      { thinking: { type: 'enabled' }, reasoning_effort: 'low' },
+    ],
+    // GLM-5.3 always thinks; a "disabled" request degrades to the lightest
+    // effort instead of the API-rejected thinking {type: 'disabled'}.
+    [
+      'glm',
+      'glm-5.3',
+      { mode: 'disabled' },
+      { thinking: { type: 'enabled' }, reasoning_effort: 'low' },
+    ],
+    [
+      'glm',
+      'glm-5.3-flash',
+      { mode: 'disabled' },
+      { thinking: { type: 'enabled' }, reasoning_effort: 'low' },
+    ],
     ['xiaomi', 'mimo-v2.5', { mode: 'disabled' }, { thinking: { type: 'disabled' } }],
     [
       'deepseek',
@@ -634,7 +692,7 @@ describe('OpenAI provider defaults', () => {
     ],
     [
       'tencent-hunyuan',
-      'hy3-preview',
+      'hy3',
       { mode: 'enabled', effort: 'high' },
       { chat_template_kwargs: { reasoning_effort: 'high' } },
     ],
@@ -665,6 +723,100 @@ describe('OpenAI provider defaults', () => {
     });
     expect(body).not.toHaveProperty('reasoning_effort');
     expect(body).not.toHaveProperty('enable_thinking');
+  });
+
+  describe('generic thinking toggle for uncatalogued models', () => {
+    const selfHosted = {
+      providerId: 'acme-vllm' as ProviderId,
+      modelId: 'qwen3-32b-instruct-local',
+      baseUrl: 'https://vllm.example/v1',
+    };
+    const capture = (thinkingConfig?: Record<string, unknown>) =>
+      captureInjectedRequestBody(
+        selfHosted.providerId,
+        selfHosted.modelId,
+        thinkingConfig,
+        selfHosted.baseUrl,
+        { providerType: 'openai' },
+      );
+
+    it('sends enable_thinking=false when thinking is explicitly disabled', async () => {
+      const body = await capture({ enabled: false });
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+    });
+
+    it('sends enable_thinking=true with a positive budget when thinking is enabled', async () => {
+      const body = await capture({ mode: 'enabled', budgetTokens: 2048 });
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: true, thinking_budget: 2048 });
+    });
+
+    it('omits a non-positive budget when thinking is enabled', async () => {
+      const body = await capture({ enabled: true, budgetTokens: 0 });
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: true });
+    });
+
+    it('leaves the request unchanged when no thinking mode is configured', async () => {
+      expect(await capture(undefined)).toEqual({
+        model: selfHosted.modelId,
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      expect(await capture({ effort: 'high' })).not.toHaveProperty('chat_template_kwargs');
+      expect(await capture({ mode: 'auto' })).not.toHaveProperty('chat_template_kwargs');
+    });
+
+    it('does not retry the reasoning pass-back when the toggle disables thinking', async () => {
+      const originalFetch = globalThis.fetch;
+      const globalRecord = globalThis as Record<string, unknown>;
+      const originalThinkingContext = globalRecord.__thinkingContext;
+      const bodies: Array<Record<string, unknown>> = [];
+      globalThis.fetch = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        bodies.push(JSON.parse(init?.body as string));
+        return new Response(
+          JSON.stringify({
+            error: { message: 'The `reasoning_content` in the thinking mode must be passed back.' },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }) as typeof fetch;
+      try {
+        globalRecord.__thinkingContext = { getStore: () => ({ mode: 'disabled' }) };
+        getModel({ ...selfHosted, providerType: 'openai', apiKey: 'sk-test' });
+        const options = openAiMock.createOpenAI.mock.calls.at(-1)?.[0] as
+          | { fetch?: typeof fetch }
+          | undefined;
+        await options!.fetch!('https://example.test/v1/chat/completions', {
+          method: 'POST',
+          body: JSON.stringify({
+            model: selfHosted.modelId,
+            messages: [
+              { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function' }] },
+            ],
+          }),
+        });
+      } finally {
+        globalThis.fetch = originalFetch;
+        if (originalThinkingContext === undefined) delete globalRecord.__thinkingContext;
+        else globalRecord.__thinkingContext = originalThinkingContext;
+      }
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0]).toMatchObject({ chat_template_kwargs: { enable_thinking: false } });
+    });
+
+    it('keeps catalogued adapters unchanged', async () => {
+      const qwen = await captureInjectedRequestBody('qwen', 'qwen3.6-plus', { mode: 'disabled' });
+      expect(qwen).toMatchObject({ enable_thinking: false });
+      expect(qwen).not.toHaveProperty('chat_template_kwargs');
+    });
+
+    it('sends nothing for catalogued models whose thinking is not controllable', async () => {
+      const body = await captureInjectedRequestBody('grok', 'grok-4.20-reasoning', {
+        mode: 'disabled',
+      });
+      expect(body).toEqual({
+        model: 'grok-4.20-reasoning',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+    });
   });
 
   it('recovers reasoning_content from a custom OpenAI gateway stream', async () => {
@@ -703,6 +855,190 @@ describe('OpenAI provider defaults', () => {
     }
   });
 
+  describe('reasoning_content pass-back retry on uncatalogued thinking models', () => {
+    // The shape a leading skill handle produces: a synthesized assistant
+    // tool call (no reasoning) followed by its tool result.
+    const skillPreloadMessages = () => [
+      { role: 'user', content: '/deep-research topic' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          {
+            id: 'call-skill',
+            type: 'function',
+            function: { name: 'read', arguments: '{"path":"SKILL.md"}' },
+          },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'call-skill', content: 'skill body' },
+      { role: 'assistant', content: 'Earlier plain answer.' },
+      { role: 'user', content: 'go on' },
+    ];
+
+    const passBackError = () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            message: 'The `reasoning_content` in the thinking mode must be passed back to the API.',
+            type: 'invalid_request_error',
+            code: 'invalid_request_error',
+          },
+        }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      );
+    const success = () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+
+    async function sendThroughCompat(
+      target: {
+        providerId: ProviderId;
+        modelId: string;
+        providerType?: 'openai';
+        baseUrl?: string;
+      },
+      responses: Array<() => Response>,
+      thinkingConfig?: Record<string, unknown>,
+    ) {
+      const originalFetch = globalThis.fetch;
+      const globalRecord = globalThis as Record<string, unknown>;
+      const originalThinkingContext = globalRecord.__thinkingContext;
+      const bodies: Array<Record<string, unknown>> = [];
+      const fetchMock = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        bodies.push(JSON.parse(init?.body as string));
+        const next = responses[bodies.length - 1] ?? responses.at(-1)!;
+        return next();
+      });
+      try {
+        globalThis.fetch = fetchMock as typeof fetch;
+        globalRecord.__thinkingContext = { getStore: () => thinkingConfig };
+        getModel({ ...target, apiKey: 'sk-test' });
+        const options = openAiMock.createOpenAI.mock.calls.at(-1)?.[0] as
+          | { fetch?: typeof fetch }
+          | undefined;
+        const response = await options!.fetch!('https://example.test/v1/chat/completions', {
+          method: 'POST',
+          body: JSON.stringify({
+            model: target.modelId,
+            stream: true,
+            messages: skillPreloadMessages(),
+          }),
+        });
+        return { bodies, response };
+      } finally {
+        globalThis.fetch = originalFetch;
+        if (originalThinkingContext === undefined) {
+          delete globalRecord.__thinkingContext;
+        } else {
+          globalRecord.__thinkingContext = originalThinkingContext;
+        }
+      }
+    }
+
+    const customGateway = {
+      providerId: 'acme-gateway' as ProviderId,
+      providerType: 'openai' as const,
+      modelId: 'deepseek-v4-pro',
+      baseUrl: 'https://gateway.example/v1',
+    };
+
+    function assistants(body: Record<string, unknown>) {
+      return (body.messages as Array<Record<string, unknown>>).filter(
+        (message) => message.role === 'assistant',
+      );
+    }
+
+    it('sends the request unchanged when the provider accepts it', async () => {
+      const { bodies, response } = await sendThroughCompat(customGateway, [success]);
+
+      expect(bodies).toHaveLength(1);
+      expect(response.status).toBe(200);
+      for (const message of assistants(bodies[0]!)) {
+        expect(message).not.toHaveProperty('reasoning_content');
+      }
+    });
+
+    it('retries once with an empty reasoning_content on tool-call turns', async () => {
+      const { bodies, response } = await sendThroughCompat(customGateway, [passBackError, success]);
+
+      expect(bodies).toHaveLength(2);
+      expect(response.status).toBe(200);
+      const [toolCallTurn, plainTurn] = assistants(bodies[1]!);
+      expect(toolCallTurn).toMatchObject({
+        reasoning_content: '',
+        tool_calls: [{ id: 'call-skill' }],
+      });
+      expect(plainTurn).not.toHaveProperty('reasoning_content');
+      expect({ ...bodies[1], messages: undefined }).toEqual({ ...bodies[0], messages: undefined });
+    });
+
+    it('surfaces the retry error without retrying again', async () => {
+      const { bodies, response } = await sendThroughCompat(customGateway, [passBackError]);
+
+      expect(bodies).toHaveLength(2);
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain('passed back');
+    });
+
+    it('does not retry an unrelated 400', async () => {
+      const unrelated = () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              message: 'Invalid value for messages[1].content',
+              type: 'invalid_request_error',
+            },
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      const { bodies, response } = await sendThroughCompat(customGateway, [unrelated, success]);
+
+      expect(bodies).toHaveLength(1);
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain('Invalid value');
+    });
+
+    it('does not retry when the wire disables thinking', async () => {
+      const { bodies, response } = await sendThroughCompat(
+        {
+          providerId: 'openai',
+          modelId: 'deepseek-v4-flash-vision-exp',
+          baseUrl: 'https://gateway.example/v1',
+        },
+        [passBackError, success],
+        { enabled: false },
+      );
+
+      expect(bodies).toHaveLength(1);
+      expect(bodies[0]).toMatchObject({ chat_template_kwargs: { thinking: false } });
+      expect(response.status).toBe(400);
+    });
+
+    it('keeps the catalogued DeepSeek fill and never retries catalogued models', async () => {
+      const deepseek = await sendThroughCompat(
+        { providerId: 'deepseek', modelId: 'deepseek-v4-pro' },
+        [success],
+      );
+      expect(deepseek.bodies).toHaveLength(1);
+      for (const message of assistants(deepseek.bodies[0]!)) {
+        expect(message).toMatchObject({ reasoning_content: '' });
+      }
+
+      const qwen = await sendThroughCompat({ providerId: 'qwen', modelId: 'qwen3.7-max' }, [
+        passBackError,
+        success,
+      ]);
+      expect(qwen.bodies).toHaveLength(1);
+      expect(qwen.response.status).toBe(400);
+      for (const message of assistants(qwen.bodies[0]!)) {
+        expect(message).not.toHaveProperty('reasoning_content');
+      }
+    });
+  });
+
   it('omits a zero SiliconFlow thinking budget when thinking is disabled', async () => {
     const body = await captureInjectedRequestBody('siliconflow', 'deepseek-ai/DeepSeek-V3.2', {
       mode: 'disabled',
@@ -710,6 +1046,113 @@ describe('OpenAI provider defaults', () => {
 
     expect(body).toMatchObject({ enable_thinking: false });
     expect(body).not.toHaveProperty('thinking_budget');
+  });
+
+  it('attaches the extended-timeout LLM dispatcher to compat-transport requests', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    try {
+      globalThis.fetch = fetchMock as typeof fetch;
+
+      getModel({ providerId: 'glm', modelId: 'glm-5.2', apiKey: 'sk-test' });
+      const options = openAiMock.createOpenAI.mock.calls.at(-1)?.[0] as
+        | { fetch?: typeof fetch }
+        | undefined;
+      expect(options?.fetch).toBeTruthy();
+
+      await options?.fetch?.('https://example.test/v1/chat/completions', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'glm-5.2',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+
+      // A non-streaming completion only receives headers once the whole
+      // (possibly 5+ minute thinking) completion exists, so the request must
+      // carry a dispatcher whose headers timeout outlives undici's 300 s
+      // default — otherwise "Headers Timeout Error" at exactly 5 minutes.
+      const init = fetchMock.mock.calls.at(-1)?.[1] as RequestInit & {
+        dispatcher?: unknown;
+      };
+      expect(init?.dispatcher).toBeTruthy();
+      expect(LLM_FETCH_TIMEOUT_MS).toBeGreaterThan(300_000);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('routes native OpenAI requests through the same dispatcher', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    try {
+      globalThis.fetch = fetchMock as typeof fetch;
+
+      getModel({ providerId: 'openai', modelId: 'gpt-5.3', apiKey: 'sk-test' });
+      const options = openAiMock.createOpenAI.mock.calls.at(-1)?.[0] as
+        | { fetch?: typeof fetch }
+        | undefined;
+      // The native transport (no custom base URL, no config.fetchImpl) also
+      // installs the shared transport so long completions survive.
+      expect(options?.fetch).toBeTruthy();
+
+      await options?.fetch?.('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+      });
+
+      const init = fetchMock.mock.calls.at(-1)?.[1] as RequestInit & {
+        dispatcher?: unknown;
+      };
+      expect(init?.dispatcher).toBeTruthy();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('keeps a caller-supplied dispatcher instead of replacing it', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async (_url: RequestInfo | URL, _init?: RequestInit) => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    try {
+      globalThis.fetch = fetchMock as typeof fetch;
+
+      getModel({ providerId: 'openai', modelId: 'gpt-5.3', apiKey: 'sk-test' });
+      const options = openAiMock.createOpenAI.mock.calls.at(-1)?.[0] as
+        | { fetch?: typeof fetch }
+        | undefined;
+
+      // A transport that brings its own dispatcher (config.fetchImpl can)
+      // must not have it silently swapped for the shared LLM dispatcher.
+      const callerDispatcher = { caller: true };
+      await options?.fetch?.('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        dispatcher: callerDispatcher,
+      } as RequestInit & { dispatcher: unknown });
+
+      const init = fetchMock.mock.calls.at(-1)?.[1] as RequestInit & {
+        dispatcher?: unknown;
+      };
+      expect(init?.dispatcher).toBe(callerDispatcher);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it('disables Lemonade thinking by default for recognized local reasoning models', async () => {
@@ -787,5 +1230,88 @@ describe('OpenAI provider defaults', () => {
         globalRecord.__thinkingContext = originalThinkingContext;
       }
     }
+  });
+});
+
+describe('Grok streaming compatibility (OPENAI_COMPAT_USE_STREAMING_CHAT)', () => {
+  beforeEach(() => {
+    openAiMock.chat.mockClear();
+    openAiMock.responses.mockClear();
+    openAiMock.createOpenAI.mockReset();
+    openAiMock.createOpenAI.mockReturnValue({
+      chat: openAiMock.chat,
+      responses: openAiMock.responses,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /**
+   * The body Grok's endpoint is actually sent, for a caller that asked for a
+   * plain (non-streaming) completion.
+   *
+   * The compat path is the only thing that rewrites that request into a stream,
+   * so `stream: true` upstream is the observable difference. The dialect cannot
+   * stand in for it here: `shouldUseOpenAIResponsesApi` is OpenAI-only, so grok
+   * goes through Chat Completions either way.
+   */
+  async function upstreamRequestBody(baseUrl: string): Promise<Record<string, unknown>> {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(JSON.stringify({ id: 'chatcmpl_test' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    );
+    try {
+      globalThis.fetch = fetchMock as typeof fetch;
+      getModel({ providerId: 'grok', modelId: 'grok-4.6', apiKey: 'sk-test', baseUrl });
+
+      const options = openAiMock.createOpenAI.mock.calls.at(-1)?.[0] as
+        | { fetch?: typeof fetch }
+        | undefined;
+      await options?.fetch?.('https://example.test/v1/chat/completions', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: 'grok-4.6',
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+
+      const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+      return JSON.parse(init.body as string) as Record<string, unknown>;
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+
+  it('streams a relay base URL, so the gateway idle timer never fires', async () => {
+    vi.stubEnv('OPENAI_COMPAT_USE_STREAMING_CHAT', 'true');
+
+    const body = await upstreamRequestBody('https://relay.example/v1');
+
+    expect(body.stream).toBe(true);
+  });
+
+  it.each(['https://api.x.ai/v1', 'https://api.x.ai/v1/', ' https://API.x.ai/v1 '])(
+    "leaves Grok's own endpoint on the plain transport: %s",
+    async (baseUrl) => {
+      vi.stubEnv('OPENAI_COMPAT_USE_STREAMING_CHAT', 'true');
+
+      const body = await upstreamRequestBody(baseUrl);
+
+      expect(body.stream).toBeUndefined();
+    },
+  );
+
+  it('leaves a relay on the plain transport while the flag is off', async () => {
+    vi.stubEnv('OPENAI_COMPAT_USE_STREAMING_CHAT', 'false');
+
+    const body = await upstreamRequestBody('https://relay.example/v1');
+
+    expect(body.stream).toBeUndefined();
   });
 });

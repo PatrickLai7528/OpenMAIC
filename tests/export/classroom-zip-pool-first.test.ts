@@ -2,18 +2,30 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AssetManifestEntry } from '@openmaic/dsl';
 
 const mocks = vi.hoisted(() => ({
+  audioRows: new Map<
+    string,
+    {
+      id: string;
+      stageId: string;
+      blob: Blob;
+      format: string;
+      ossKey?: string;
+      createdAt: number;
+    }
+  >(),
+  fetchMediaUrl: vi.fn(),
   rows: new Map<string, { id: string; stageId: string; blob: Blob; mimeType?: string }>(),
   poolResolve: vi.fn(),
   poolRelease: vi.fn(),
 }));
 
-vi.mock('@/lib/utils/database', () => ({
+vi.mock('@/lib/device-storage/database', () => ({
   mediaFileKey: (stageId: string, ref: string) => `${stageId}:${ref}`,
   db: {
     mediaFiles: {
       get: async (id: string) => mocks.rows.get(id),
     },
-    audioFiles: { get: vi.fn() },
+    audioFiles: { get: async (id: string) => mocks.audioRows.get(id) },
   },
 }));
 
@@ -21,13 +33,20 @@ vi.mock('@/lib/media/asset-pool', () => ({
   getAssetPool: () => ({ resolve: mocks.poolResolve, release: mocks.poolRelease }),
 }));
 
+vi.mock('@/lib/media/fetch-media-url', () => ({
+  fetchMediaUrl: (...args: unknown[]) => mocks.fetchMediaUrl(...args),
+}));
+
 import {
   audioArchivePath,
+  collectAudioFiles,
   collectMediaFiles,
   legacyAudioArchivePath,
   mediaArchivePath,
   mediaPosterArchivePath,
 } from '@/lib/export/classroom-zip-utils';
+
+import { streamingWavBytes } from '../fixtures/streaming-wav';
 
 const entry = (ref: string): AssetManifestEntry => ({ ref, kind: 'image' });
 
@@ -38,9 +57,83 @@ function seedRow(ref: string, blob: Blob, stageId = 'stage-1') {
 
 describe('classroom ZIP media collection', () => {
   afterEach(() => {
+    mocks.audioRows.clear();
     mocks.rows.clear();
     vi.clearAllMocks();
     vi.unstubAllGlobals();
+  });
+
+  it('ships CDN-backed narration when its compatibility blob was evicted', async () => {
+    const ref = 'ast_remote_audio';
+    const ossKey = 'https://cdn.example.com/audio/remote.mp3';
+    mocks.audioRows.set(ref, {
+      id: ref,
+      stageId: 'stage-1',
+      blob: new Blob([]),
+      format: 'mp3',
+      ossKey,
+      createdAt: 0,
+    });
+    mocks.poolResolve.mockResolvedValue(null);
+    mocks.fetchMediaUrl.mockResolvedValue(
+      new Response(new Blob(['remote-audio'], { type: 'audio/mpeg' }), { status: 200 }),
+    );
+
+    const collected = await collectAudioFiles([{ ref, kind: 'audio' }]);
+
+    expect(mocks.fetchMediaUrl).toHaveBeenCalledWith(ossKey, 15_000);
+    expect(collected).toHaveLength(1);
+    expect(collected[0]?.zipPath).toBe('audio/audio-1.mp3');
+    expect(await collected[0]?.record.blob.text()).toBe('remote-audio');
+  });
+
+  it('labels narration by the container its bytes are, not the stored format', async () => {
+    const ref = 'ast_wav_labelled_mp3';
+    // A provider answered WAV (with a streaming placeholder length) without a
+    // usable Content-Type, so the row was recorded as mp3.
+    mocks.audioRows.set(ref, {
+      id: ref,
+      stageId: 'stage-1',
+      blob: new Blob([streamingWavBytes()], { type: 'audio/mpeg' }),
+      format: 'mp3',
+      createdAt: 0,
+    });
+    mocks.poolResolve.mockResolvedValue(null);
+
+    const collected = await collectAudioFiles([{ ref, kind: 'audio' }]);
+
+    expect(collected[0]).toMatchObject({ zipPath: 'audio/audio-1.wav', mimeType: 'audio/wav' });
+    expect(collected[0]?.record.format).toBe('wav');
+  });
+
+  it('labels AAC ADTS behind an ID3 tag as aac, not mp3', async () => {
+    const ref = 'ast_tagged_aac';
+    const tag = [0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 0, 20];
+    const bytes = Uint8Array.from([...tag, ...new Array(20).fill(0), 0xff, 0xf1, 0x50, 0x80, 0, 0]);
+    mocks.audioRows.set(ref, {
+      id: ref,
+      stageId: 'stage-1',
+      blob: new Blob([bytes], { type: 'audio/mpeg' }),
+      format: 'mp3',
+      createdAt: 0,
+    });
+    mocks.poolResolve.mockResolvedValue(null);
+    const collected = await collectAudioFiles([{ ref, kind: 'audio' }]);
+    expect(collected[0]).toMatchObject({ zipPath: 'audio/audio-1.aac', mimeType: 'audio/aac' });
+  });
+
+  it('keeps the stored format for bytes it does not recognize', async () => {
+    const ref = 'ast_opaque_audio';
+    mocks.audioRows.set(ref, {
+      id: ref,
+      stageId: 'stage-1',
+      blob: new Blob(['opaque'], { type: 'audio/ogg' }),
+      format: 'ogg',
+      createdAt: 0,
+    });
+    mocks.poolResolve.mockResolvedValue(null);
+    const collected = await collectAudioFiles([{ ref, kind: 'audio' }]);
+    expect(collected[0]).toMatchObject({ zipPath: 'audio/audio-1.ogg', mimeType: 'audio/ogg' });
   });
 
   /**

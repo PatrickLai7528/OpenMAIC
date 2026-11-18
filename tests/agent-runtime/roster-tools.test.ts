@@ -16,6 +16,7 @@
  *    generate_roster.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Value } from 'typebox/value';
 
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 import type { GeneratedAgentConfig } from '@openmaic/dsl';
@@ -23,6 +24,7 @@ import type { GeneratedAgentConfig } from '@openmaic/dsl';
 import {
   buildRosterTools,
   ROSTER_TOOL_NAMES,
+  ROSTER_TOOLS_PROMPT,
   type CourseDocument,
   type CourseStore,
 } from '@/lib/server/agent-runtime/roster-tools';
@@ -41,6 +43,24 @@ vi.mock('@/lib/server/provider-config', async (importOriginal) => {
     resolveTTSApiKey: mocks.resolveTTSApiKey,
   };
 });
+
+/** The tts slot as the mocked server listing describes it (first enabled provider). */
+function ttsFromMocks() {
+  const [providerId] = (mocks.enabledServerTTSProviderIds() as string[] | undefined) ?? [];
+  if (!providerId) return null;
+  const apiKey = mocks.resolveTTSApiKey(providerId) as string | undefined;
+  const baseUrl = (
+    mocks as { resolveTTSBaseUrl?: (id: string) => string | undefined }
+  ).resolveTTSBaseUrl?.(providerId);
+  return {
+    providerId,
+    ...(apiKey ? { apiKey } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+    managed: true,
+    userEndpoint: false,
+    origin: 'configuration' as const,
+  };
+}
 
 /** In-memory DocumentStore stub: just the methods the roster tools use. */
 function makeStore(initial: CourseDocument | null = null): CourseStore {
@@ -77,6 +97,7 @@ interface ToolResultShape {
 
 function buildTools(deps: Record<string, unknown> = {}): AgentTool<never, never>[] {
   return buildRosterTools({
+    ttsConnection: ttsFromMocks(),
     store: makeStore(makeDoc()),
     onCheckpoint: () => {},
     ...deps,
@@ -90,6 +111,7 @@ async function runTool(
   deps: Record<string, unknown> = {},
 ): Promise<ToolResultShape> {
   const tools = buildRosterTools({
+    ttsConnection: ttsFromMocks(),
     store,
     onCheckpoint: () => {},
     ...deps,
@@ -158,6 +180,106 @@ describe('set_roster', () => {
       delivery: 'calm',
     });
     expect(doc?.stage?.agentIds).toEqual(roster?.map((agent) => agent.id));
+  });
+
+  // Codex P2 on PR #1908: set_roster must advertise and persist language-independent
+  // voiceDesign.gender. A Chinese identity like 「年轻女性学生」 has no English
+  // male/female fallback, so dropping gender on rewrite sends fallbacks back to
+  // the index pick and can mismatch catalogue gender again.
+  it('persists language-independent voiceDesign.gender for non-English identities', async () => {
+    const store = makeStore(makeDoc());
+    const result = await runTool(store, 'set_roster', {
+      stageId: 'stage-test',
+      agents: [
+        {
+          name: '林老师',
+          role: 'teacher',
+          persona: '耐心引导，从已知出发。',
+          voiceDesign: {
+            identity: '中年男教师',
+            gender: 'male',
+            texture: '沉稳低沉',
+            delivery: '从容鼓励',
+          },
+        },
+        {
+          name: '小雨',
+          role: 'student',
+          persona: '好奇爱问。',
+          voiceDesign: {
+            identity: '年轻女性学生',
+            gender: 'female',
+            texture: '清亮轻快',
+            delivery: '活泼认真',
+          },
+        },
+        { name: '阿杰', role: 'student', persona: '认真听讲。' },
+      ],
+    });
+
+    expect(result.isError).toBeUndefined();
+    const roster = (await store.loadDocument('stage-test'))?.stage?.generatedAgentConfigs ?? [];
+    expect(roster[0]?.voiceDesign).toEqual({
+      identity: '中年男教师',
+      gender: 'male',
+      texture: '沉稳低沉',
+      delivery: '从容鼓励',
+    });
+    expect(roster[1]?.voiceDesign).toEqual({
+      identity: '年轻女性学生',
+      gender: 'female',
+      texture: '清亮轻快',
+      delivery: '活泼认真',
+    });
+    // Schema and runner guidance must advertise gender so a schema-following
+    // rewrite cannot omit it for course-language identities.
+    const tools = buildTools({ store });
+    const setRoster = tools.find((tool) => tool.name === 'set_roster');
+    expect(JSON.stringify(setRoster?.parameters)).toContain('"gender"');
+    expect(ROSTER_TOOLS_PROMPT).toMatch(/voiceDesign\.gender|gender to "male"/);
+  });
+
+  it('requires gender whenever set_roster voiceDesign is present', () => {
+    const setRoster = buildTools().find((tool) => tool.name === 'set_roster');
+    expect(setRoster).toBeDefined();
+    const teacher = { name: '林老师', role: 'teacher', persona: '耐心引导，从已知出发。' };
+    const student = { name: '小雨', role: 'student', persona: '好奇爱问。' };
+    const voiceDesign = {
+      identity: '年轻女性学生',
+      texture: '清亮轻快',
+      delivery: '活泼认真',
+    };
+    expect(
+      Value.Check(setRoster!.parameters, {
+        stageId: 'stage-test',
+        agents: [teacher, { ...student, voiceDesign: { ...voiceDesign, gender: 'female' } }],
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(setRoster!.parameters, {
+        stageId: 'stage-test',
+        agents: [teacher, { ...student, voiceDesign: { ...voiceDesign, gender: 'male' } }],
+      }),
+    ).toBe(true);
+    // voiceDesign stays optional; a design without gender is not schema-valid.
+    expect(
+      Value.Check(setRoster!.parameters, {
+        stageId: 'stage-test',
+        agents: [teacher, student],
+      }),
+    ).toBe(true);
+    expect(
+      Value.Check(setRoster!.parameters, {
+        stageId: 'stage-test',
+        agents: [teacher, { ...student, voiceDesign }],
+      }),
+    ).toBe(false);
+    expect(
+      Value.Check(setRoster!.parameters, {
+        stageId: 'stage-test',
+        agents: [teacher, { ...student, voiceDesign: { ...voiceDesign, gender: '女性' } }],
+      }),
+    ).toBe(false);
   });
 
   it('rejects fewer than 2 agents', async () => {
@@ -345,6 +467,104 @@ describe('set_roster', () => {
     expect(result.details?.error).toBe('voice-not-in-catalog');
     expect((await store.loadDocument('stage-test'))?.stage?.generatedAgentConfigs).toBeUndefined();
   });
+
+  it('accepts a catalogue voice whose gender matches voiceDesign.gender', async () => {
+    mocks.enabledServerTTSProviderIds.mockReturnValue(['openai-tts']);
+    const store = makeStore(makeDoc());
+    const result = await runTool(store, 'set_roster', {
+      stageId: 'stage-test',
+      agents: [
+        { name: '林老师', role: 'teacher', persona: '耐心引导。' },
+        {
+          name: '小雨',
+          role: 'student',
+          persona: '好奇爱问。',
+          voice: 'openai-tts::nova',
+          voiceDesign: {
+            identity: '年轻女性学生',
+            gender: 'female',
+            texture: '清亮',
+            delivery: '轻快',
+          },
+        },
+      ],
+    });
+
+    expect(result.isError).toBeUndefined();
+    const roster = (await store.loadDocument('stage-test'))?.stage?.generatedAgentConfigs ?? [];
+    expect(roster[1]?.voiceConfig).toEqual({ providerId: 'openai-tts', voiceId: 'nova' });
+    expect(roster[1]?.voiceDesign?.gender).toBe('female');
+  });
+
+  it('accepts a neutral or unknown voice gender and a binding with no voiceDesign.gender', async () => {
+    mocks.enabledServerTTSProviderIds.mockReturnValue(['openai-tts']);
+    const store = makeStore(makeDoc());
+    const femaleDesign = {
+      identity: '年轻女性学生',
+      gender: 'female' as const,
+      texture: '清亮',
+      delivery: '轻快',
+    };
+    const neutral = await runTool(store, 'set_roster', {
+      stageId: 'stage-test',
+      agents: [
+        { name: '林老师', role: 'teacher', persona: '耐心引导。' },
+        {
+          name: '小雨',
+          role: 'student',
+          persona: '好奇爱问。',
+          voice: 'openai-tts::alloy',
+          voiceDesign: femaleDesign,
+        },
+      ],
+    });
+    expect(neutral.isError).toBeUndefined();
+    expect(
+      (await store.loadDocument('stage-test'))?.stage?.generatedAgentConfigs?.[1]?.voiceConfig,
+    ).toEqual({ providerId: 'openai-tts', voiceId: 'alloy' });
+
+    const unknown = await runTool(
+      store,
+      'set_roster',
+      {
+        stageId: 'stage-test',
+        agents: [
+          { name: '林老师', role: 'teacher', persona: '耐心引导。' },
+          {
+            name: '小雨',
+            role: 'student',
+            persona: '好奇爱问。',
+            voice: 'openai-tts::session-voice',
+            voiceDesign: femaleDesign,
+          },
+        ],
+      },
+      {
+        registeredVoices: [{ providerId: 'openai-tts', voiceId: 'session-voice', name: 'Session' }],
+      },
+    );
+    expect(unknown.isError).toBeUndefined();
+    expect(
+      (await store.loadDocument('stage-test'))?.stage?.generatedAgentConfigs?.[1]?.voiceConfig,
+    ).toEqual({ providerId: 'openai-tts', voiceId: 'session-voice' });
+
+    const noDesignGender = await runTool(store, 'set_roster', {
+      stageId: 'stage-test',
+      agents: [
+        {
+          name: '林老师',
+          role: 'teacher',
+          persona: '耐心引导。',
+          voice: 'openai-tts::echo',
+        },
+        { name: '小雨', role: 'student', persona: '好奇爱问。' },
+      ],
+    });
+    expect(noDesignGender.isError).toBeUndefined();
+    expect(
+      (await store.loadDocument('stage-test'))?.stage?.generatedAgentConfigs?.[0]?.voiceConfig,
+    ).toEqual({ providerId: 'openai-tts', voiceId: 'echo' });
+  });
 });
 
 describe('list_voices', () => {
@@ -396,12 +616,20 @@ describe('list_voices', () => {
   // Paid vendor showcase presets must never reach the agent even when the
   // provider is served AND keyed — explicit provider flag, not "no env so
   // absent" (declared exclusion mechanism).
-  it('never exposes paid qwen-tts presets even when served and keyed', async () => {
-    mocks.enabledServerTTSProviderIds.mockReturnValue(['qwen-tts', 'doubao-tts']);
+  it('lists the voices of the tts slot provider only', async () => {
+    mocks.enabledServerTTSProviderIds.mockReturnValue(['doubao-tts']);
     const result = await runTool(makeStore(makeDoc()), 'list_voices', {});
     const voices = (result.details?.voices ?? []) as Array<Record<string, unknown>>;
     const bindings = voices.map((voice) => voice.binding);
     expect(bindings).toContain('doubao-tts::zh_female_vv_uranus_bigtts');
+    expect(bindings.every((binding) => String(binding).startsWith('doubao-tts::'))).toBe(true);
+  });
+
+  it('never exposes paid qwen-tts presets even when it is the keyed tts provider', async () => {
+    mocks.enabledServerTTSProviderIds.mockReturnValue(['qwen-tts']);
+    const result = await runTool(makeStore(makeDoc()), 'list_voices', {});
+    const voices = (result.details?.voices ?? []) as Array<Record<string, unknown>>;
+    const bindings = voices.map((voice) => voice.binding);
     expect(bindings).not.toContain('qwen-tts::Cherry');
     expect(bindings.some((binding) => String(binding).startsWith('qwen-tts::'))).toBe(false);
   });
@@ -429,6 +657,7 @@ describe('roster abort handling', () => {
     const controller = new AbortController();
     controller.abort();
     const tools = buildRosterTools({
+      ttsConnection: ttsFromMocks(),
       store,
       onCheckpoint: () => {},
     });
@@ -453,9 +682,12 @@ describe('roster owner gate (reference semantics)', () => {
     mocks.resolveTTSApiKey.mockReturnValue('sk-test');
     const store = makeStore(makeDoc());
     const save = vi.spyOn(store as unknown as { saveDocument(): Promise<void> }, 'saveDocument');
-    const tools = withOwnerStageAuthorization(buildRosterTools({ store, onCheckpoint: () => {} }), {
-      stageAccess: async () => ({ kind: 'foreign' as const }),
-    });
+    const tools = withOwnerStageAuthorization(
+      buildRosterTools({ ttsConnection: ttsFromMocks(), store, onCheckpoint: () => {} }),
+      {
+        stageAccess: async () => ({ kind: 'foreign' as const }),
+      },
+    );
     const set = tools.find((candidate) => candidate.name === 'set_roster');
     if (!set) throw new Error('set_roster not registered');
 
@@ -473,7 +705,11 @@ describe('roster owner gate (reference semantics)', () => {
 
   it('list_voices (no stage target) passes through the owner gate untouched', async () => {
     const tools = withOwnerStageAuthorization(
-      buildRosterTools({ store: makeStore(makeDoc()), onCheckpoint: () => {} }),
+      buildRosterTools({
+        ttsConnection: ttsFromMocks(),
+        store: makeStore(makeDoc()),
+        onCheckpoint: () => {},
+      }),
       {
         stageAccess: async () => ({ kind: 'foreign' as const }),
       },
@@ -496,5 +732,126 @@ describe('roster tool registry', () => {
     expect(names).toContain('set_roster');
     expect(names).toContain('list_voices');
     expect(names).not.toContain('generate_roster');
+  });
+});
+
+it.each(['openai-tts'])(
+  'uses a replacement catalogue in list_voices and set_roster for %s',
+  async (providerId) => {
+    const ttsConnection = {
+      providerId,
+      apiKey: 'test-key',
+      managed: true,
+      userEndpoint: false,
+      origin: 'configuration',
+      voices: [{ id: 'vivian', name: 'Vivian' }],
+    };
+    const store = makeStore(makeDoc());
+    const listed = await runTool(store, 'list_voices', {}, { ttsConnection });
+    expect(
+      (listed.details?.voices as Array<{ binding: string }>).map((voice) => voice.binding),
+    ).toEqual([`${providerId}::vivian`]);
+    const result = await runTool(
+      store,
+      'set_roster',
+      {
+        stageId: 'stage-test',
+        agents: [
+          {
+            name: 'Teacher',
+            role: 'teacher',
+            persona: 'Patient teacher.',
+            voice: `${providerId}::vivian`,
+          },
+          { name: 'Student', role: 'student', persona: 'Curious learner.' },
+        ],
+      },
+      { ttsConnection },
+    );
+    expect(result.isError).toBeUndefined();
+  },
+);
+
+it('keeps excluded configured Qwen voices out of roster tools while allowing registered clones', async () => {
+  const ttsConnection = {
+    providerId: 'qwen-tts',
+    apiKey: 'test-key',
+    managed: true,
+    userEndpoint: false,
+    origin: 'configuration',
+    voices: [{ id: 'vivian', name: 'Vivian' }],
+  };
+  const registeredVoices = [
+    { providerId: 'qwen-tts', voiceId: 'my-clone', name: 'My clone', kind: 'clone' },
+  ];
+  const store = makeStore(makeDoc());
+  const listed = await runTool(store, 'list_voices', {}, { ttsConnection, registeredVoices });
+  expect(
+    (listed.details?.voices as Array<{ binding: string }>).map((voice) => voice.binding),
+  ).toEqual(['qwen-tts::my-clone']);
+  const roster = (voice: string) => ({
+    stageId: 'stage-test',
+    agents: [
+      { name: 'Teacher', role: 'teacher', persona: 'Patient teacher.', voice },
+      { name: 'Student', role: 'student', persona: 'Curious learner.' },
+    ],
+  });
+  const rejected = await runTool(store, 'set_roster', roster('qwen-tts::vivian'), {
+    ttsConnection,
+    registeredVoices,
+  });
+  expect(rejected.isError).toBe(true);
+  const accepted = await runTool(store, 'set_roster', roster('qwen-tts::my-clone'), {
+    ttsConnection,
+    registeredVoices,
+  });
+  expect(accepted.isError).toBeUndefined();
+});
+
+describe('voice registration instructions and capability awareness', () => {
+  it('ROSTER_TOOLS_PROMPT does not unconditionally instruct register_voice and forbids it without a configured backend', () => {
+    expect(ROSTER_TOOLS_PROMPT).toContain(
+      'register_voice must not be attempted without a configured backend.',
+    );
+    expect(ROSTER_TOOLS_PROMPT).toContain('re-register it if voice registration is available');
+    expect(ROSTER_TOOLS_PROMPT).not.toMatch(/re-register it, bind a catalog voice/);
+  });
+
+  it('list_voices description omits voice registration when backend is unavailable and warns against attempting it', () => {
+    const tools = buildRosterTools({
+      store: makeStore(makeDoc()),
+      onCheckpoint: () => {},
+      ttsConnection: null,
+    });
+    const listVoices = tools.find((t) => t.name === 'list_voices');
+    expect(listVoices).toBeDefined();
+    expect(listVoices?.description).toContain(
+      'register_voice must not be attempted without a configured backend.',
+    );
+    expect(listVoices?.description).not.toContain(
+      'A cloned voice registered this session with register_voice appears here too.',
+    );
+  });
+
+  it('list_voices description preserves existing instructions when voice registration backend is available', () => {
+    const tools = buildRosterTools({
+      store: makeStore(makeDoc()),
+      onCheckpoint: () => {},
+      ttsConnection: {
+        providerId: 'qwen-tts',
+        apiKey: 'test-key',
+        managed: true,
+        userEndpoint: false,
+        origin: 'configuration',
+      },
+    });
+    const listVoices = tools.find((t) => t.name === 'list_voices');
+    expect(listVoices).toBeDefined();
+    expect(listVoices?.description).toContain(
+      'A cloned voice registered this session with register_voice appears here too.',
+    );
+    expect(listVoices?.description).not.toContain(
+      'register_voice must not be attempted without a configured backend.',
+    );
   });
 });

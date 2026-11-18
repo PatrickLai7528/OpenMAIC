@@ -40,7 +40,13 @@ import { Check, HelpCircle } from 'lucide-react';
 import type { ChatNode } from '@/lib/workbench/session-store';
 import { defaultWorkbenchTranslator, type WorkbenchTranslator } from '@/lib/i18n/workbench';
 import { wbStyles as styles } from './chat-styles';
-import { useQuestionAnswer } from './question-card-state';
+import { TextBlock } from './text-block';
+import { QuestionDetails } from './question-details';
+import { isFreeTextOption, useQuestionAnswer } from './question-card-state';
+import { useQuestionAutoConfirm } from '@/lib/workbench/question-auto-confirm';
+import { sessionScopedKey } from '@/lib/workbench/request-scope';
+import { useWorkbenchStore } from '@/lib/workbench/session-store';
+import { useEffect } from 'react';
 
 /** What the surfaces say about whose move it is. */
 export const QUESTION_WAITING_LABEL = defaultWorkbenchTranslator('workbench.question.waiting');
@@ -48,11 +54,15 @@ export const QUESTION_ANSWERED_LABEL = defaultWorkbenchTranslator('workbench.que
 /** The way back to the composer form, on the one card whose form was waved off. */
 export const QUESTION_REVIVE_LABEL = defaultWorkbenchTranslator('workbench.question.revive');
 
+/** Where the form that holds an open question sits, for the collapsed row's pointer. */
+export type QuestionPointer = 'below' | 'preview';
+
 export function QuestionCard({
   node,
   onAnswer,
   onRevive,
   collapsed = false,
+  pointer = 'below',
   t = defaultWorkbenchTranslator,
 }: {
   readonly node: ChatNode;
@@ -69,13 +79,15 @@ export function QuestionCard({
    * composer back over with it. The card never knows about that state itself —
    * the host hands it this callback or nothing.
    */
-  readonly onRevive?: () => void;
+  readonly onRevive?: (freeText?: boolean) => void;
   /**
    * This question's form currently owns the composer, so the row is the pointer
    * to it and nothing more. Never true together with `onRevive`: one means the
    * form is up, the other means it was waved off.
    */
   readonly collapsed?: boolean;
+  /** The form is the composer's (`below`) or the request preview's (`preview`). */
+  readonly pointer?: QuestionPointer;
   readonly t?: WorkbenchTranslator;
 }) {
   const answer = useQuestionAnswer(node, onAnswer, t);
@@ -86,6 +98,17 @@ export function QuestionCard({
   // An answered question is a record, so it never collapses: the form is gone by
   // then and this row is the only place the question survives.
   const summaryOnly = collapsed && !answered;
+  // Answered by the auto-confirm countdown, not by a click: said once, quietly,
+  // so the user knows a later message is how to change it.
+  const sessionId = useWorkbenchStore((s) => s.sessionId);
+  const autoKey = sessionScopedKey(sessionId, node.key);
+  const loadAutoConfirmed = useQuestionAutoConfirm((s) => s.load);
+  useEffect(() => {
+    if (answered) loadAutoConfirmed();
+  }, [answered, loadAutoConfirmed]);
+  const autoConfirmed = useQuestionAutoConfirm(
+    (s) => answered && s.autoConfirmed.includes(autoKey),
+  );
 
   return (
     <div
@@ -94,6 +117,7 @@ export function QuestionCard({
       data-answered={answered ? 'true' : 'false'}
       data-collapsed={summaryOnly ? 'true' : 'false'}
       data-mode={mode}
+      data-auto-confirmed={autoConfirmed ? 'true' : undefined}
     >
       <div className={styles.questionCard.head}>
         {answered ? (
@@ -104,11 +128,22 @@ export function QuestionCard({
         <span>{t(answered ? 'workbench.question.answered' : 'workbench.question.waiting')}</span>
         {summaryOnly ? (
           <span className={styles.questionCard.summaryPointer}>
-            {t('workbench.question.inFormBelow')}
+            {t(
+              pointer === 'preview'
+                ? 'workbench.question.inPreview'
+                : 'workbench.question.inFormBelow',
+            )}
           </span>
         ) : null}
       </div>
-      {summaryOnly ? null : <p className={styles.questionCard.question}>{node.text}</p>}
+      {summaryOnly ? null : (
+        <div className={styles.questionCard.question}>
+          <TextBlock text={node.text} />
+        </div>
+      )}
+      {summaryOnly || !node.questionDetails ? null : (
+        <QuestionDetails text={node.questionDetails} t={t} />
+      )}
       {options.length > 0 && !summaryOnly ? (
         <div className={styles.questionCard.options} role="group" aria-label={node.text}>
           {options.map((option) => {
@@ -120,10 +155,13 @@ export function QuestionCard({
                 data-testid={`workbench-question-option-${option.id}`}
                 data-picked={isPicked ? 'true' : 'false'}
                 aria-pressed={mode === 'multi' ? isPicked : undefined}
-                disabled={locked}
+                // The free-text choice asks for writing: it hands back to the
+                // form's text row, and is dead where there is no form to reopen.
+                disabled={locked || (isFreeTextOption(option.id) && !onRevive)}
                 className={styles.questionCard.option}
                 onClick={() => {
-                  if (mode === 'multi') answer.toggle(option.id);
+                  if (isFreeTextOption(option.id)) onRevive?.(true);
+                  else if (mode === 'multi') answer.toggle(option.id);
                   else answer.answerWith(option.label);
                 }}
               >
@@ -131,10 +169,20 @@ export function QuestionCard({
                   <Check className={styles.questionCard.optionCheck} aria-hidden="true" />
                 ) : null}
                 <span className={styles.questionCard.optionLabel}>{option.label}</span>
+                {option.recommended ? (
+                  <span className={styles.questionCard.recommended}>
+                    {t('workbench.question.recommended')}
+                  </span>
+                ) : null}
               </button>
             );
           })}
         </div>
+      ) : null}
+      {autoConfirmed ? (
+        <p className={styles.questionCard.autoNote} data-testid="workbench-question-auto-confirmed">
+          {t('workbench.question.autoConfirmed')}
+        </p>
       ) : null}
       {footer && !summaryOnly ? (
         <div className={styles.questionCard.footer}>
@@ -154,7 +202,7 @@ export function QuestionCard({
               type="button"
               data-testid="workbench-question-revive"
               className={styles.questionCard.revive}
-              onClick={onRevive}
+              onClick={() => onRevive()}
             >
               {t('workbench.question.revive')}
             </button>

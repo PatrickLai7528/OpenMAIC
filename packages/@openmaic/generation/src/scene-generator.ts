@@ -5,17 +5,19 @@
  * from scene outlines.
  */
 
+import { validateShapeGeometry, shapeToTextFallback } from '@openmaic/geometry';
 import { nanoid } from 'nanoid';
 import katex from 'katex';
 import type {
   Action,
   PBLProject,
   PPTElement,
+  PPTShapeElement,
   QuizQuestion,
   SlideBackground,
   WidgetType,
 } from '@openmaic/dsl';
-import { isWidgetType, normalizeElement } from '@openmaic/dsl';
+import { isWidgetType, normalizeElement, safeKatexOptions } from '@openmaic/dsl';
 import { MAX_VISION_IMAGES } from './constants.js';
 import {
   formatImageDescription,
@@ -31,6 +33,7 @@ import type {
 } from './outline-types.js';
 import { DEFAULT_LANGUAGE_DIRECTIVE } from './outline-generator.js';
 import { postProcessInteractiveHtml } from './interactive-post-processor.js';
+import { findInteractiveScriptSyntaxFailure } from './interactive-script-validator.js';
 import { parseActionsFromStructuredOutput } from './action-parser.js';
 import { parseJsonResponse } from './json-repair.js';
 import {
@@ -40,6 +43,12 @@ import {
 } from './prompt-formatters.js';
 import type { PromptId } from './prompts/types.js';
 import { buildPrompt, PROMPT_IDS } from './prompts/index.js';
+import { buildSlideContentPrompt } from './scene-prompts.js';
+import {
+  formatAdditionalWidgetRequirements,
+  formatWidgetVariables,
+  resolveWidgetDesignIdea,
+} from './widget-outline-format.js';
 import type {
   GeneratedInteractiveContent,
   GeneratedPBLContent,
@@ -76,6 +85,7 @@ export type SceneContentFailureCode = 'prompt-unavailable' | 'invalid-model-outp
 
 export interface SceneContentFailure {
   code: SceneContentFailureCode;
+  message?: string;
 }
 
 export interface SceneContentOptions {
@@ -499,7 +509,8 @@ function fixElementDefaults(
       // 1. Repair: a JSON `null` from the model means "absent" — strip nulls so
       //    normalize treats the field as missing and fills/derives it, instead
       //    of failing on a wrong-typed null (`start: null`, `text: null`, …).
-      // 2. Drop: if normalization still throws, discard the element. Keeping
+      // 2. Recover shape labels with the shared bounded text projection; discard
+      //    other elements when normalization still fails. Keeping
       //    the raw element would hand the malformed payload to consumers that
       //    read it unguarded (getElementRange / BaseLineElement / the PPTX
       //    exporter index straight into `start[0]`), crashing playback or
@@ -510,10 +521,28 @@ function fixElementDefaults(
         normalized = normalizeElement(stripNulls(el));
       } catch (err) {
         log.warn(
-          `Dropping malformed generated element: ${err instanceof Error ? err.message : String(err)}`,
+          `Malformed generated element: ${err instanceof Error ? err.message : String(err)}`,
         );
-        return null;
+        // The same recovery also handles malformed required path/viewBox types.
+        return el && typeof el === 'object' && el.type === 'shape'
+          ? shapeToTextFallback(el as unknown as PPTShapeElement)
+          : null;
       }
+
+      if (normalized.type === 'shape') {
+        const validation = validateShapeGeometry(normalized);
+        if (!validation.ok) {
+          const { field, position, message } = validation.error;
+          log.warn(
+            `Invalid generated shape; using text fallback when a label exists: ${field}${position === undefined ? '' : ` at ${position}`}: ${message}`,
+          );
+          return shapeToTextFallback(normalized);
+        }
+      }
+
+      // Ordinary model-authored text stays upright. Shape recovery returns
+      // above, preserving the original shape label's rotation in its text box.
+      if (normalized.type === 'text') normalized = { ...normalized, rotate: 0 };
 
       // Fit the image box to the assigned PDF image's real aspect ratio (`src` is
       // still the img_id at this point). Producer-specific, so it lives here, not
@@ -525,13 +554,19 @@ function fixElementDefaults(
           const curW = normalized.width || 400;
           const curH = normalized.height || 300;
           if (Math.abs(curW / curH - knownRatio) / knownRatio > 0.1) {
-            // Keep width, correct height
-            const newH = Math.round(curW / knownRatio);
-            if (newH > 462) {
-              // canvas 562.5 - margins 50×2
-              return { ...normalized, width: Math.round(462 * knownRatio), height: 462 };
-            }
-            return { ...normalized, height: newH };
+            // Contain-fit (like `object-fit: contain`): the largest box with the
+            // real ratio inside the model's box, centered in it. Never grows past
+            // the model's box, so it cannot cover the elements laid out around it.
+            const fitByWidth = curW / curH < knownRatio;
+            const newW = fitByWidth ? curW : Math.round(curH * knownRatio);
+            const newH = fitByWidth ? Math.round(curW / knownRatio) : curH;
+            return {
+              ...normalized,
+              left: Math.round((normalized.left ?? 0) + (curW - newW) / 2),
+              top: Math.round((normalized.top ?? 0) + (curH - newH) / 2),
+              width: newW,
+              height: newH,
+            };
           }
         }
       }
@@ -577,11 +612,14 @@ function processLatexElements(
       }
 
       try {
-        const html = katex.renderToString(latexStr, {
-          throwOnError: false,
-          displayMode: true,
-          output: 'html',
-        });
+        const html = katex.renderToString(
+          latexStr,
+          safeKatexOptions({
+            throwOnError: false,
+            displayMode: true,
+            output: 'html',
+          }),
+        );
 
         return {
           ...el,
@@ -670,7 +708,6 @@ async function generateSlideContent(
   const generatedImageEnabled = generatedImageEntries.length > 0;
   const generatedVideoEnabled = generatedVideoEntries.length > 0;
   const imageElementEnabled = hasAssignedImages || generatedImageEnabled;
-  const mediaElementEnabled = imageElementEnabled || generatedVideoEnabled;
 
   // Add generated media placeholders info (images + videos)
   if (outline.mediaGenerations && outline.mediaGenerations.length > 0) {
@@ -701,27 +738,21 @@ async function generateSlideContent(
     }
   }
 
-  // Canvas dimensions (matching viewportSize and viewportRatio)
-  const canvasWidth = 1000;
-  const canvasHeight = 562.5;
-
   const teacherContext = formatTeacherPersonaForPrompt(agents);
 
-  const prompts = buildPrompt(PROMPT_IDS.SLIDE_CONTENT, {
-    title: outline.title,
-    description: outline.description,
-    keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
-    elements: '（根据要点自动生成）',
-    assignedImages: assignedImagesText,
-    canvas_width: canvasWidth,
-    canvas_height: canvasHeight,
-    teacherContext,
-    languageDirective: languageDirective || '',
-    imageElementEnabled,
-    generatedImageEnabled,
-    generatedVideoEnabled,
-    mediaElementEnabled,
-  });
+  const prompts = buildSlideContentPrompt(
+    { imageElementEnabled, generatedImageEnabled, generatedVideoEnabled },
+    {
+      title: outline.title,
+      description: outline.description,
+      keyPoints: (outline.keyPoints || []).map((p, i) => `${i + 1}. ${p}`).join('\n'),
+      design: outline.design?.trim() || '',
+      elements: '（根据要点自动生成）',
+      assignedImages: assignedImagesText,
+      teacherContext,
+      languageDirective: languageDirective || '',
+    },
+  );
 
   if (!prompts) {
     onFailure?.({ code: 'prompt-unavailable' });
@@ -780,10 +811,19 @@ async function generateSlideContent(
     return null;
   }
 
+  const invalidRotation = findInvalidShapeRotation(generatedData.elements);
+  if (invalidRotation) {
+    log.error(invalidRotation);
+    onFailure?.({ code: 'invalid-model-output', message: invalidRotation });
+    return null;
+  }
+
   log.debug(`Got ${generatedData.elements.length} elements for: ${outline.title}`);
 
   // Debug: Log image elements before resolution
-  const imageElements = generatedData.elements.filter((el) => el.type === 'image');
+  const imageElements = generatedData.elements.filter(
+    (el) => el && typeof el === 'object' && el.type === 'image',
+  );
   if (imageElements.length > 0) {
     log.debug(
       `Image elements before resolution:`,
@@ -825,7 +865,13 @@ async function generateSlideContent(
   const processedElements: PPTElement[] = videoNormalizedElements.map((el) => ({
     ...el,
     id: `${el.type}_${nanoid(8)}`,
-    rotate: 0,
+    // Ordinary text was reset above; recovered shape labels retain their angle.
+    rotate:
+      (el.type === 'shape' || el.type === 'text') &&
+      typeof el.rotate === 'number' &&
+      Number.isFinite(el.rotate)
+        ? el.rotate
+        : 0,
   })) as PPTElement[];
 
   // Process background
@@ -846,6 +892,26 @@ async function generateSlideContent(
     background,
     remark: generatedData.remark || outline.description,
   };
+}
+
+function findInvalidShapeRotation(elements: GeneratedSlideData['elements']): string | undefined {
+  for (const [index, element] of elements.entries()) {
+    if (!element || typeof element !== 'object') {
+      continue;
+    }
+    if (element.type !== 'shape' || !Object.prototype.hasOwnProperty.call(element, 'rotate')) {
+      continue;
+    }
+
+    const rotate = element.rotate;
+    if (rotate === null || (typeof rotate === 'number' && Number.isFinite(rotate))) {
+      continue;
+    }
+
+    const received = typeof rotate === 'number' ? String(rotate) : JSON.stringify(rotate);
+    return `Invalid shape rotation at shape[${index}].rotate: expected a finite number in degrees or null, received ${received}`;
+  }
+  return undefined;
 }
 
 /**
@@ -891,29 +957,95 @@ async function generateQuizContent(
 
   log.debug(`Got ${generatedQuestions.length} questions for: ${outline.title}`);
 
-  // Ensure each question has an ID and normalize options format
+  // Ensure each question has an ID and normalize options format.
+  // Plain strings become letter/content pairs. Object fields stay as written.
   const questions: QuizQuestion[] = generatedQuestions.map((q) => {
     const isText = q.type === 'short_answer';
+    const options = isText ? undefined : normalizeQuizOptions(q.options);
     return {
       ...q,
       id: q.id || `q_${nanoid(8)}`,
-      options: isText ? undefined : normalizeQuizOptions(q.options),
-      answer: isText ? undefined : normalizeQuizAnswer(q as unknown as Record<string, unknown>),
+      options,
+      answer: isText
+        ? undefined
+        : normalizeQuizAnswer(q as unknown as Record<string, unknown>, options),
       hasAnswer: isText ? false : true,
     };
   });
 
+  const contractFailure = findQuizOptionsContractFailure(questions);
+  if (contractFailure) {
+    log.error(`Quiz option contract failed for "${outline.title}": ${contractFailure}`);
+    onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
   return { questions };
 }
+
+const QUIZ_OPTION_VALUE = /^[A-Z]$/;
+
+/**
+ * Reason a built quiz breaks the choice-option contract, or null when it holds.
+ *
+ * Choice questions (everything except `short_answer`) need a non-empty option
+ * list whose `value`s are single ASCII letters A-Z, and every answer entry
+ * must equal one of those values exactly. Short-answer questions are skipped.
+ */
+export function findQuizOptionsContractFailure(questions: readonly QuizQuestion[]): string | null {
+  for (let index = 0; index < questions.length; index += 1) {
+    const question = questions[index];
+    if (!question || question.type === 'short_answer') continue;
+
+    const where = question.id ? `question ${index + 1} (${question.id})` : `question ${index + 1}`;
+    const options = question.options;
+    if (!options || options.length === 0) {
+      return `${where}: choice question has no options`;
+    }
+
+    const optionValues = new Set<string>();
+
+    for (let optionIndex = 0; optionIndex < options.length; optionIndex += 1) {
+      const value = options[optionIndex]?.value;
+      if (typeof value !== 'string' || !QUIZ_OPTION_VALUE.test(value)) {
+        const shown = JSON.stringify(value);
+        return `${where}: option ${optionIndex + 1} value ${shown} is not a single letter A-Z`;
+      }
+
+      if (optionValues.has(value)) {
+        return `${where}: option ${optionIndex + 1} repeats value ${JSON.stringify(value)}`;
+      }
+
+      optionValues.add(value);
+    }
+
+    const answer = question.answer;
+    if (!answer || answer.length === 0) {
+      return `${where}: answer key does not reference an option value`;
+    }
+
+    for (const entry of answer) {
+      if (!optionValues.has(entry)) {
+        return `${where}: answer ${JSON.stringify(entry)} does not match an option value`;
+      }
+    }
+  }
+
+  return null;
+}
+
+type NormalizedQuizOption = { value: string; label: string };
 
 /**
  * Normalize quiz options from AI response.
  * AI may generate plain strings ["OptionA", "OptionB"] or QuizOption objects.
- * This normalizes to QuizOption[] format: { value: "A", label: "OptionA" }
+ * Plain strings become { value: "A", label: "OptionA" }. Object `value` and
+ * `label` are kept as provided — a letter in `label` with content in `value`
+ * is not swapped.
  */
-function normalizeQuizOptions(
+export function normalizeQuizOptions(
   options: unknown[] | undefined,
-): { value: string; label: string }[] | undefined {
+): NormalizedQuizOption[] | undefined {
   if (!options || !Array.isArray(options)) return undefined;
 
   return options.map((opt, index) => {
@@ -939,8 +1071,20 @@ function normalizeQuizOptions(
  * Normalize quiz answer from AI response.
  * AI may generate correctAnswer as string or string[], under various field names.
  * This normalizes to string[] format matching option values.
+ *
+ * The LLM writes the answer key inconsistently, as option CONTENT ("(6, 2)")
+ * or as a LETTER ("A"). Only exact, unique alignment is resolved: an entry
+ * that equals exactly one option value, or exactly one option label, becomes
+ * that option's value. Formatting variants (case, whitespace, full-width
+ * forms, wrapper punctuation) are NOT normalized, and ambiguous entries (two
+ * options sharing a value or a label) are left untouched — consistent with
+ * the grading-side resolver, which must not accept a variant a stored key
+ * would never resolve to.
  */
-function normalizeQuizAnswer(question: Record<string, unknown>): string[] | undefined {
+export function normalizeQuizAnswer(
+  question: Record<string, unknown>,
+  options?: { value: string; label: string }[],
+): string[] | undefined {
   // AI might use "correctAnswer", "answer", or "correct_answer"
   const raw =
     question.answer ??
@@ -948,10 +1092,25 @@ function normalizeQuizAnswer(question: Record<string, unknown>): string[] | unde
     (question as Record<string, unknown>).correct_answer;
   if (!raw) return undefined;
 
-  if (Array.isArray(raw)) {
-    return raw.map(String);
+  const answers = (Array.isArray(raw) ? raw : [raw]).map(String);
+
+  if (!options || options.length === 0) {
+    return answers;
   }
-  return [String(raw)];
+
+  // Exact alignment only (per review): value or label must match the answer
+  // byte-for-byte; no case folding, whitespace/Unicode normalization, or
+  // wrapper interpretation. Fail closed on ambiguity: convert only when
+  // exactly one distinct option value matches.
+  return answers.map((a) => {
+    const valueMatches = options.filter((o) => o.value === a);
+    const labelMatches = options.filter((o) => o.label === a);
+    const candidates = new Set<string>();
+    for (const o of valueMatches) candidates.add(o.value);
+    for (const o of labelMatches) candidates.add(o.value);
+    if (candidates.size === 1) return [...candidates][0];
+    return a;
+  });
 }
 
 /**
@@ -1144,8 +1303,8 @@ export async function generateWidgetContent(
         conceptName: widgetOutline.concept || outline.title,
         conceptOverview: outline.description,
         keyPoints: (outline.keyPoints || []).join('\n'),
-        variables: widgetOutline.keyVariables?.join(', ') || '',
-        designIdea: '',
+        variables: formatWidgetVariables(widgetOutline.keyVariables),
+        designIdea: resolveWidgetDesignIdea(outline),
         languageDirective: languageDirective || '',
       };
       break;
@@ -1231,6 +1390,8 @@ export async function generateWidgetContent(
       return null;
   }
 
+  variables.additionalRequirements = formatAdditionalWidgetRequirements(outline, widgetType);
+
   const prompts = buildPrompt(promptId, variables);
   if (!prompts) {
     log.error(`Failed to build ${widgetType} prompt for: ${outline.title}`);
@@ -1244,6 +1405,16 @@ export async function generateWidgetContent(
 
   if (!html) {
     log.error(`Failed to extract HTML from ${widgetType} response for: ${outline.title}`);
+    options.onFailure?.({ code: 'invalid-model-output' });
+    return null;
+  }
+
+  // Reject visually valid but inert widgets whose classic inline JS cannot parse.
+  const scriptSyntaxFailure = findInteractiveScriptSyntaxFailure(html);
+  if (scriptSyntaxFailure) {
+    log.error(
+      `Generated ${widgetType} widget contains invalid inline JavaScript in script #${scriptSyntaxFailure.scriptIndex}: ${scriptSyntaxFailure.message}`,
+    );
     options.onFailure?.({ code: 'invalid-model-output' });
     return null;
   }

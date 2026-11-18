@@ -8,6 +8,7 @@ import {
 } from '@/lib/document';
 import {
   getDocumentExtractorManifestEntries,
+  getDocumentExtractorManifestEntry,
   getMediaExtractorManifestEntries,
 } from '@/lib/document/extractors/manifest';
 import { PROVIDER_SUPPORTED_MIME_TYPES } from '@/lib/document/mime';
@@ -30,6 +31,8 @@ describe('document extractor registry', () => {
       'mineru',
       'mineru-cloud',
       'alidocmind',
+      'minicpm-ocr',
+      'deepseek-ocr',
     ]);
     expect(providers.every((provider) => provider.supportedMimeTypes)).toBe(true);
     expect(
@@ -37,6 +40,21 @@ describe('document extractor registry', () => {
         .filter((provider) => provider.id !== 'plain-text')
         .every((provider) => provider.supportedMimeTypes.includes('application/pdf')),
     ).toBe(true);
+  });
+
+  it('marks the parsing services a deployment configures, not the local extractors', () => {
+    const providers = getDocumentExtractorProviders();
+
+    expect(
+      providers
+        .filter((provider) => !provider.requiresServiceConfig)
+        .map((provider) => provider.id),
+    ).toEqual(['plain-text', 'unpdf']);
+    for (const provider of providers) {
+      expect(provider.requiresServiceConfig, `provider ${provider.id}`).toBe(
+        getDocumentExtractorManifestEntry(provider.id)?.requiresServiceConfig,
+      );
+    }
   });
 
   it('exposes a local plain-text extractor for TXT and Markdown', () => {
@@ -206,6 +224,29 @@ describe('document extractor registry', () => {
       ocr: true,
       async: true,
     });
+  });
+
+  it('exposes MiniCPM-OCR for PDFs and images with async OCR capability', () => {
+    const minicpm = getDocumentExtractorProvider('minicpm-ocr');
+    expect(minicpm).toBeDefined();
+    expect(minicpm?.displayName).toBe('MiniCPM-OCR');
+    expect(minicpm?.supportedMimeTypes).toEqual([
+      'application/pdf',
+      'image/png',
+      'image/jpeg',
+      'image/bmp',
+      'image/webp',
+    ]);
+    expect(minicpm?.capabilities).toMatchObject({
+      text: true,
+      images: false,
+      tables: true,
+      formulas: true,
+      layout: true,
+      ocr: true,
+      async: true,
+    });
+    expect(minicpm?.requiresServiceConfig).toBe(true);
   });
 
   it('keeps the client-safe manifest in exact sync with both registries (RFC #1153 part 1)', () => {

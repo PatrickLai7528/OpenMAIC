@@ -43,21 +43,17 @@ import {
 } from '@/lib/choreography';
 import {
   canJumpWithinReconstructablePrefix,
+  getSpeechVisualCueStartIndex,
   isWhiteboardPlaybackAction,
 } from '@/lib/playback/action-navigation';
 import { useCanvasStore } from '@/lib/store/canvas';
 import { useSettingsStore } from '@/lib/store/settings';
-import { isTTSProviderEnabled } from '@/lib/audio/provider-enablement';
+import { ttsSelection } from '@/lib/audio/tts-selection';
+import { detectSpeechLang } from '@/lib/audio/browser-tts-preview';
 import { createLogger } from '@/lib/logger';
+import i18n from '@/lib/i18n/config';
 
 const log = createLogger('PlaybackEngine');
-
-/**
- * If more than 30% of characters are CJK, treat the text as Chinese.
- * Intentionally low: mixed Chinese text often contains punctuation,
- * numbers, and short Latin fragments (e.g. "AI课堂").
- */
-const CJK_LANG_THRESHOLD = 0.3;
 
 export class PlaybackEngine {
   private scenes: Scene[] = [];
@@ -94,6 +90,8 @@ export class PlaybackEngine {
   private browserTTSPausedChunks: string[] = []; // remaining chunks saved on pause (for cancel+re-speak)
   private speechTimerRemaining: number = 0; // remaining ms (set on pause)
   private playbackGeneration: number = 0;
+  // Keep the cursor on speech for progress/persistence; defer its cues until playback starts.
+  private pendingNavigationSpeechIndex: number | null = null;
 
   constructor(
     scenes: Scene[],
@@ -141,6 +139,7 @@ export class PlaybackEngine {
 
   /** Restore playback position from a snapshot */
   restoreFromSnapshot(snapshot: PlaybackSnapshot): void {
+    this.pendingNavigationSpeechIndex = null;
     this.sceneIndex = snapshot.sceneIndex;
     this.actionIndex = snapshot.actionIndex;
     this.consumedDiscussions = new Set(snapshot.consumedDiscussions);
@@ -155,6 +154,7 @@ export class PlaybackEngine {
 
     this.sceneIndex = 0;
     this.actionIndex = 0;
+    this.pendingNavigationSpeechIndex = null;
     this.invalidatePlaybackGeneration();
     this.setMode('playing');
     this.processNext();
@@ -185,6 +185,7 @@ export class PlaybackEngine {
 
     const autoplay = options.autoplay ?? this.mode === 'playing';
     const generation = this.invalidatePlaybackGeneration();
+    this.pendingNavigationSpeechIndex = null;
     this.cancelActivePlaybackWork();
     this.sceneIndex = 0;
     this.actionIndex = 0;
@@ -198,7 +199,16 @@ export class PlaybackEngine {
       if (!this.isCurrentGeneration(generation)) return false;
       const action = actions[i];
       if (isWhiteboardPlaybackAction(action)) {
-        await this.actionEngine.execute(action, { silent: true });
+        try {
+          await this.actionEngine.execute(action, { silent: true });
+        } catch (error) {
+          log.error(
+            'Skipping failed action during whiteboard restoration:',
+            action.id,
+            action.type,
+            error,
+          );
+        }
       }
     }
 
@@ -206,6 +216,7 @@ export class PlaybackEngine {
     this.actionEngine.clearEffects();
     this.sceneIndex = 0;
     this.actionIndex = actionIndex;
+    this.pendingNavigationSpeechIndex = actionIndex;
     this.callbacks.onProgress?.(this.getSnapshot());
 
     if (autoplay) {
@@ -277,6 +288,7 @@ export class PlaybackEngine {
     } else {
       // Resume lecture
       this.setMode('playing');
+      this.callbacks.beforeSpeech?.();
       if (this.browserTTSPausedChunks.length > 0) {
         // Browser TTS was paused via cancel — re-speak remaining chunks
         this.browserTTSActive = true;
@@ -316,6 +328,7 @@ export class PlaybackEngine {
   /** → idle */
   stop(): void {
     this.invalidatePlaybackGeneration();
+    this.pendingNavigationSpeechIndex = null;
     // Set mode BEFORE stopping audio to prevent spurious processNext from
     // synchronous onend callbacks (see handleUserInterrupt for details).
     this.setMode('idle');
@@ -546,6 +559,17 @@ export class PlaybackEngine {
     return { action: res.action, sceneId: res.sceneId };
   }
 
+  private fireVisualCue(action: Extract<Action, { type: 'spotlight' | 'laser' }>): void {
+    this.actionEngine.execute(action);
+    this.callbacks.onEffectFire?.({
+      kind: action.type,
+      targetId: action.elementId,
+      ...(action.type === 'spotlight'
+        ? { dimOpacity: action.dimOpacity }
+        : { color: action.color }),
+    } as Effect);
+  }
+
   /**
    * Core processing loop: consume the next action.
    */
@@ -573,6 +597,20 @@ export class PlaybackEngine {
 
     const { action } = current;
 
+    const replayCues =
+      this.sceneIndex === 0 && this.pendingNavigationSpeechIndex === this.actionIndex;
+    this.pendingNavigationSpeechIndex = null;
+    if (replayCues && action.type === 'speech') {
+      const actions = this.scenes[0].actions ?? [];
+      const targetIndex = this.actionIndex;
+      for (let i = getSpeechVisualCueStartIndex(actions, targetIndex); i < targetIndex; i++) {
+        if (this.mode !== 'playing' || !this.isCurrentGeneration(generation)) return;
+        const cue = actions[i];
+        if (cue.type === 'spotlight' || cue.type === 'laser') this.fireVisualCue(cue);
+      }
+      if (this.mode !== 'playing' || !this.isCurrentGeneration(generation)) return;
+    }
+
     // Notify progress BEFORE advancing the cursor so the snapshot points at
     // the current action.  On restore the same action will be replayed — this
     // is the desired behaviour for speech (user may have only heard half).
@@ -583,6 +621,7 @@ export class PlaybackEngine {
     switch (action.type) {
       case 'speech': {
         const speechAction = action as SpeechAction;
+        this.callbacks.beforeSpeech?.();
         this.callbacks.onSpeechStart?.(speechAction.text);
 
         // onEnded → processNext; if paused, resume() will call processNext
@@ -629,15 +668,9 @@ export class PlaybackEngine {
             if (!audioStarted) {
               // No pre-generated audio — try browser-native TTS only when it is
               // the selected provider AND actually enabled (opt-in, #665).
-              const settings = useSettingsStore.getState();
               if (
                 hasText &&
-                settings.ttsEnabled &&
-                settings.ttsProviderId === 'browser-native-tts' &&
-                isTTSProviderEnabled(
-                  'browser-native-tts',
-                  settings.ttsProvidersConfig?.['browser-native-tts'],
-                ) &&
+                ttsSelection()?.providerId === 'browser-native-tts' &&
                 typeof window !== 'undefined' &&
                 window.speechSynthesis
               ) {
@@ -658,14 +691,7 @@ export class PlaybackEngine {
       case 'spotlight':
       case 'laser': {
         // Fire-and-forget visual effects via ActionEngine
-        this.actionEngine.execute(action);
-        this.callbacks.onEffectFire?.({
-          kind: action.type,
-          targetId: action.elementId,
-          ...(action.type === 'spotlight'
-            ? { dimOpacity: action.dimOpacity }
-            : { color: action.color }),
-        } as Effect);
+        this.fireVisualCue(action);
         // Don't block — continue immediately (use queueMicrotask to avoid
         // stack overflow from deep synchronous recursion when many consecutive
         // spotlight/laser actions appear in sequence)
@@ -731,8 +757,12 @@ export class PlaybackEngine {
       case 'widget_setState':
       case 'widget_annotation':
       case 'widget_reveal': {
-        // Synchronous actions — await completion, then continue
-        await this.actionEngine.execute(action);
+        // A rejected stored action must not strand playback before the next action.
+        try {
+          await this.actionEngine.execute(action);
+        } catch (error) {
+          log.error('Skipping failed playback action:', action.id, action.type, error);
+        }
         if (!this.isCurrentGeneration(generation)) return;
         if (this.mode === 'playing') {
           this.processNext(generation);
@@ -794,6 +824,8 @@ export class PlaybackEngine {
     }
 
     const settings = useSettingsStore.getState();
+    // The user's voice when it was picked for browser speech.
+    const selectedVoice = ttsSelection()?.voice;
     const chunkText = this.browserTTSChunks[this.browserTTSChunkIndex];
     const utterance = new SpeechSynthesisUtterance(chunkText);
 
@@ -808,8 +840,8 @@ export class PlaybackEngine {
 
     // Set voice: try user's configured voice, fall back to auto-detect language
     let voiceFound = false;
-    if (settings.ttsVoice && settings.ttsVoice !== 'default') {
-      const voice = voices.find((v) => v.voiceURI === settings.ttsVoice);
+    if (selectedVoice && selectedVoice !== 'default') {
+      const voice = voices.find((v) => v.voiceURI === selectedVoice);
       if (voice) {
         utterance.voice = voice;
         utterance.lang = voice.lang;
@@ -818,12 +850,17 @@ export class PlaybackEngine {
     }
     if (!voiceFound) {
       // No usable voice configured — detect text language so the browser
-      // auto-selects an appropriate voice.
-      const cjkRatio =
-        chunkText.length > 0
-          ? (chunkText.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length / chunkText.length
-          : 0;
-      utterance.lang = cjkRatio > CJK_LANG_THRESHOLD ? 'zh-CN' : 'en-US';
+      // auto-selects an appropriate voice. For Vietnamese additionally bind an
+      // installed vi voice when one exists, since browsers otherwise fall back
+      // to an English voice reading Vietnamese text.
+      utterance.lang = detectSpeechLang(chunkText, i18n.language);
+      if (utterance.lang === 'vi-VN') {
+        const viVoice = voices.find((v) => v.lang?.toLowerCase().startsWith('vi'));
+        if (viVoice) {
+          utterance.voice = viVoice;
+          utterance.lang = viVoice.lang;
+        }
+      }
     }
 
     utterance.onend = () => {

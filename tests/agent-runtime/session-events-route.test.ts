@@ -13,9 +13,11 @@ vi.mock('@/lib/config/feature-flags', () => ({
   isAgentRuntimeEnabled: () => true,
   isAgentRuntimeConfigured: () => true,
 }));
-vi.mock('@/lib/server/agent-runtime/owner', () => ({
-  resolveRequestOwnerId: mocks.resolveRequestOwnerId,
-}));
+vi.mock('@/lib/server/identity/resolve', async () =>
+  (await import('../helpers/owner-resolution-mock')).ownerResolveModule(
+    mocks.resolveRequestOwnerId,
+  ),
+);
 vi.mock('@/lib/server/agent-runtime/store', () => ({
   getAgentSessionStore: vi.fn(async () => ({
     getSession: mocks.getSession,
@@ -328,4 +330,14 @@ describe('GET per-session events', () => {
     expect(mocks.readEventsAfterForReplay).toHaveBeenLastCalledWith('session-1', 5, 500);
     await reader.cancel();
   });
+});
+
+it('does not expose or control a teaching session through the generic API', async () => {
+  const id = 'pbl-role-owned';
+  const response = await GET(new NextRequest('http://localhost/api/agent/sessions/' + id), {
+    params: Promise.resolve({ id }),
+  });
+  expect(response.status).toBe(404);
+  expect(mocks.getSession).not.toHaveBeenCalled();
+  expect(mocks.readEventsAfterForReplay).not.toHaveBeenCalled();
 });

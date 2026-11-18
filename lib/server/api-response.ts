@@ -1,3 +1,4 @@
+import { ModelAuthorizationError } from './model-config/model-authorization';
 import { NextResponse } from 'next/server';
 
 export const API_ERROR_CODES = {
@@ -5,10 +6,13 @@ export const API_ERROR_CODES = {
   MISSING_API_KEY: 'MISSING_API_KEY',
   MISSING_PROVIDER: 'MISSING_PROVIDER',
   MISSING_MODEL: 'MISSING_MODEL',
+  MODEL_CONFIG_INVALID: 'MODEL_CONFIG_INVALID',
   INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
   INVALID_REQUEST: 'INVALID_REQUEST',
+  CREATE_REFUSED: 'CREATE_REFUSED',
   UNAUTHENTICATED: 'UNAUTHENTICATED',
   ASSET_NOT_FOUND: 'ASSET_NOT_FOUND',
+  ASSET_QUOTA_EXCEEDED: 'ASSET_QUOTA_EXCEEDED',
   PROVIDER_DISABLED: 'PROVIDER_DISABLED',
   VOXCPM_AUTO_VOICE_REQUIRES_CONTEXT: 'VOXCPM_AUTO_VOICE_REQUIRES_CONTEXT',
   INVALID_URL: 'INVALID_URL',
@@ -30,13 +34,20 @@ export const API_ERROR_CODES = {
   QWEN_VC_AUDIO_TOO_LARGE: 'QWEN_VC_AUDIO_TOO_LARGE',
   QWEN_VC_AUDIO_EMPTY: 'QWEN_VC_AUDIO_EMPTY',
   QWEN_VC_VOICE_NOT_FOUND: 'QWEN_VC_VOICE_NOT_FOUND',
+  QWEN_VC_RECLONE_REQUIRED: 'QWEN_VC_RECLONE_REQUIRED',
+  QWEN_VC_VOICE_REJECTED: 'QWEN_VC_VOICE_REJECTED',
+  QWEN_VC_VOICE_PROCESSING: 'QWEN_VC_VOICE_PROCESSING',
   QWEN_VC_BOOTSTRAP_UNSUPPORTED: 'QWEN_VC_BOOTSTRAP_UNSUPPORTED',
   QWEN_VC_REFERENCE_AUDIO_INVALID: 'QWEN_VC_REFERENCE_AUDIO_INVALID',
   QWEN_TTS_ERROR: 'QWEN_TTS_ERROR',
+  TTS_INVALID_RESPONSE: 'TTS_INVALID_RESPONSE',
   GENERATION_FAILED: 'GENERATION_FAILED',
   TRANSCRIPTION_FAILED: 'TRANSCRIPTION_FAILED',
+  ASR_INPUT_TOO_LARGE: 'ASR_INPUT_TOO_LARGE',
   PARSE_FAILED: 'PARSE_FAILED',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
+  ACTIVE_RUN_LIMIT: 'ACTIVE_RUN_LIMIT',
+  RUN_STATE_CONFLICT: 'RUN_STATE_CONFLICT',
 } as const;
 
 export type ApiErrorCode = (typeof API_ERROR_CODES)[keyof typeof API_ERROR_CODES];
@@ -46,6 +57,7 @@ export interface ApiErrorBody {
   errorCode: ApiErrorCode;
   error: string;
   details?: string;
+  reason?: string;
 }
 
 export function apiError(
@@ -53,6 +65,7 @@ export function apiError(
   status: number,
   error: string,
   details?: string,
+  reason?: string,
 ): NextResponse<ApiErrorBody> {
   return NextResponse.json(
     {
@@ -60,6 +73,7 @@ export function apiError(
       errorCode: code,
       error,
       ...(details ? { details } : {}),
+      ...(reason ? { reason } : {}),
     },
     { status },
   );
@@ -67,4 +81,12 @@ export function apiError(
 
 export function apiSuccess<T extends Record<string, unknown>>(data: T, status = 200): NextResponse {
   return NextResponse.json({ success: true, ...data }, { status });
+}
+
+/** A stable response for a model refused before provider access. */
+export function modelAuthorizationResponse(error: unknown): NextResponse<ApiErrorBody> | undefined {
+  if (error instanceof ModelAuthorizationError) {
+    return apiError(error.code, error.httpStatus, error.message);
+  }
+  return undefined;
 }

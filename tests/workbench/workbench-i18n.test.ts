@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
-import { createWorkbenchTranslator, workbenchEn, workbenchResourceFor } from '@/lib/i18n/workbench';
+import {
+  createWorkbenchTranslator,
+  workbenchEn,
+  workbenchResourceFor,
+  workbenchZh,
+} from '@/lib/i18n/workbench';
 import { supportedLocales } from '@/lib/i18n/locales';
 import { skillDisplayLabel, skillTitle } from '@/lib/workbench/agent-skills';
 
@@ -102,6 +107,59 @@ describe('workbench copy covers every supported locale', () => {
       const extra = overlayToolKeys.filter((key) => !baseToolKeys.includes(key));
       expect(missing, `${file} is missing tool keys the base has`).toEqual([]);
       expect(extra, `${file} has tool keys the base does not`).toEqual([]);
+    }
+  });
+
+  it('requires explicit material upload error copy in every supported locale', () => {
+    // workbenchResourceFor merges an overlay onto the base first, so a missing
+    // key still resolves. These strings are user-visible upload errors;
+    // each base and each raw overlay file has to carry them itself.
+    const requiredMaterialErrorKeys = [
+      'material.fileTooLarge',
+      'material.fileTooLargeWithLimit',
+      'material.unsupportedType',
+      'material.quotaExceeded',
+      'material.storageFull',
+    ] as const;
+    const english = flatten(workbenchEn);
+    const bases: Array<[string, Map<string, string>]> = [
+      ['en', english],
+      ['zh-CN', flatten(workbenchZh)],
+    ];
+    for (const [name, map] of bases) {
+      for (const key of requiredMaterialErrorKeys) {
+        const value = map.get(key);
+        expect(value, `${name} is missing ${key}`).toEqual(expect.any(String));
+        expect(value?.trim(), `${name}.${key} is empty`).not.toBe('');
+        expect(interpolations(value!), `${name}.${key}`).toEqual(
+          key === 'material.fileTooLargeWithLimit' ? ['limit'] : [],
+        );
+      }
+    }
+
+    const overlayLocales = supportedLocales
+      .map((locale) => locale.code)
+      .filter((code) => code !== 'zh-CN' && code !== 'en-US');
+    expect(overlayLocales).toHaveLength(10);
+    for (const code of overlayLocales) {
+      const overlay = JSON.parse(
+        fs.readFileSync(
+          path.join(process.cwd(), 'lib/i18n/workbench-locales', `${code}.json`),
+          'utf8',
+        ),
+      ) as Record<string, unknown>;
+      const flat = flatten(overlay);
+      for (const key of requiredMaterialErrorKeys) {
+        const value = flat.get(key);
+        expect(value, `${code} overlay is missing ${key}`).toEqual(expect.any(String));
+        expect(value?.trim(), `${code}.${key} is empty`).not.toBe('');
+        expect(interpolations(value!), `${code}.${key} changed its interpolations`).toEqual(
+          key === 'material.fileTooLargeWithLimit' ? ['limit'] : [],
+        );
+        expect(workbenchResourceFor(code), `${code} did not register its overlay`).toMatchObject({
+          material: { [key.slice('material.'.length)]: value },
+        });
+      }
     }
   });
 });
@@ -209,4 +267,99 @@ describe('workbench hardcoded-copy contract', () => {
     visit(ast);
     expect(offenders).toEqual([]);
   });
+});
+
+it('defines all eight knowledge-base failure explanations in all twelve locale files', () => {
+  const codes = [
+    'storage_full',
+    'source_unavailable',
+    'service_unavailable',
+    'media_too_long',
+    'no_text_extracted',
+    'processing_interrupted',
+    'too_many_pages',
+    'pages_failed',
+  ];
+  // A page refusal states only the counts the service gave: one wording per case.
+  const descriptions: Record<string, string[]> = {
+    too_many_pages: ['description', 'descriptionWithoutCount', 'descriptionWithoutLimit'],
+    pages_failed: ['description', 'descriptionWithoutCount'],
+  };
+  for (const { code } of supportedLocales) {
+    const resource = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), 'lib/i18n/locales', `${code}.json`), 'utf8'),
+    );
+    const failure = resource.workspace.knowledgeBase.failure;
+    expect(Object.keys(failure).sort()).toEqual([...codes, 'more'].sort());
+    expect(interpolations(failure.more)).toEqual(['reason']);
+    for (const reason of codes) {
+      const keys = descriptions[reason] ?? ['description'];
+      expect(Object.keys(failure[reason]).sort()).toEqual([...keys, 'label'].sort());
+      expect(failure[reason].label.trim()).not.toBe('');
+      for (const key of keys) expect(failure[reason][key].trim()).not.toBe('');
+    }
+  }
+});
+
+it('R6 defines parse and parse-again actions explicitly in all twelve locales', () => {
+  for (const { code } of supportedLocales) {
+    const resource = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), 'lib/i18n/locales', `${code}.json`), 'utf8'),
+    );
+    for (const action of ['parse', 'reparse']) {
+      expect(resource.workspace.knowledgeBase.actions[action]).toBeTypeOf('string');
+      expect(resource.workspace.knowledgeBase.actions[action].trim()).not.toBe('');
+    }
+  }
+});
+
+it('R8.5 states the media duration limit by interpolation in all twelve locales', () => {
+  for (const { code } of supportedLocales) {
+    const resource = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), 'lib/i18n/locales', `${code}.json`), 'utf8'),
+    );
+    const description: string = resource.workspace.knowledgeBase.failure.media_too_long.description;
+    expect(interpolations(description), code).toEqual(['minutes']);
+    // The number comes from the extractor's constant, never from the copy.
+    expect(description, code).not.toMatch(/\d/);
+    for (const key of ['open', 'downloadOriginal']) {
+      expect(resource.workspace.knowledgeBase.actions[key].trim(), code).not.toBe('');
+    }
+  }
+});
+
+it('states the page counts of a too-many-pages refusal by interpolation in all twelve locales', () => {
+  for (const { code } of supportedLocales) {
+    const resource = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), 'lib/i18n/locales', `${code}.json`), 'utf8'),
+    );
+    const copy = resource.workspace.knowledgeBase.failure.too_many_pages;
+    expect(interpolations(copy.description), code).toEqual(['maxPages', 'pages']);
+    expect(interpolations(copy.descriptionWithoutCount), code).toEqual(['maxPages']);
+    expect(interpolations(copy.descriptionWithoutLimit), code).toEqual([]);
+    for (const key of ['description', 'descriptionWithoutCount', 'descriptionWithoutLimit']) {
+      // The numbers come from the refusal, never from the copy.
+      expect(copy[key], code).not.toMatch(/\d/);
+    }
+  }
+});
+
+it('states the failed PDF page range in every locale', () => {
+  for (const { code } of supportedLocales) {
+    const resource = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), 'lib/i18n/locales', `${code}.json`), 'utf8'),
+    );
+    const copy = resource.workspace.knowledgeBase.failure.pages_failed;
+    expect(interpolations(copy.description), code).toEqual(['firstPage', 'lastPage']);
+    expect(interpolations(copy.descriptionWithoutCount), code).toEqual([]);
+  }
+});
+
+it('uses Arabic singular wording for one moved material', () => {
+  expect(createWorkbenchTranslator('ar-SA')('workbench.tool.chip.material', { count: 1 })).toBe(
+    '1 مادة',
+  );
+  expect(createWorkbenchTranslator('ar-SA')('workbench.tool.chip.materials', { count: 2 })).toBe(
+    '2 مواد',
+  );
 });

@@ -54,7 +54,9 @@ import {
   wbClearMs,
 } from '@/lib/choreography';
 import katex from 'katex';
+import { safeKatexOptions } from '@openmaic/dsl';
 import { createLogger } from '@/lib/logger';
+import { legacyShapeCompatibilityError } from '@/lib/whiteboard/legacy-shape';
 
 const log = createLogger('ActionEngine');
 
@@ -222,6 +224,11 @@ export class ActionEngine {
       if (action.type.startsWith('widget_')) {
         return;
       }
+    }
+
+    if (action.type === 'wb_draw_shape') {
+      const error = legacyShapeCompatibilityError(action);
+      if (error) throw new Error(error);
     }
 
     // Auto-open whiteboard if a draw/clear/delete action is attempted while it's closed
@@ -517,7 +524,7 @@ export class ActionEngine {
         id: action.elementId || '',
         type: 'shape',
         viewBox: [1000, 1000] as [number, number],
-        path: SHAPE_PATHS[action.shape] ?? SHAPE_PATHS.rectangle,
+        path: SHAPE_PATHS[action.shape],
         left: action.x,
         top: action.y,
         width: action.width,
@@ -571,11 +578,14 @@ export class ActionEngine {
     if (!wb.success || !wb.data) return;
 
     try {
-      const html = katex.renderToString(action.latex, {
-        throwOnError: false,
-        displayMode: true,
-        output: 'html',
-      });
+      const html = katex.renderToString(
+        action.latex,
+        safeKatexOptions({
+          throwOnError: false,
+          displayMode: true,
+          output: 'html',
+        }),
+      );
 
       this.stageAPI.whiteboard.addElement(
         {
@@ -786,9 +796,9 @@ export class ActionEngine {
       case 'replace_lines': {
         if (!action.lineIds?.length) return;
         const replaceIds = action.lineIds;
-        const firstIdx = lines.findIndex((l) => l.id === replaceIds[0]);
-        if (firstIdx === -1) return;
         const deleteSet = new Set(replaceIds);
+        const firstIdx = lines.findIndex((l) => deleteSet.has(l.id));
+        if (firstIdx === -1) return;
         lines = lines.filter((l) => !deleteSet.has(l.id));
         const newLines = newContentLines.map((content, i) => ({
           id: i < replaceIds.length ? replaceIds[i] : newLineIds[i],

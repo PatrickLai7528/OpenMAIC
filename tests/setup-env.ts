@@ -19,6 +19,7 @@
  */
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
+import { beforeEach, vi } from 'vitest';
 
 if (process.env.TEST_LOAD_LOCAL_ENV === '1') {
   const envPath = resolve(__dirname, '..', '.env.local');
@@ -39,3 +40,28 @@ if (process.env.TEST_LOAD_LOCAL_ENV === '1') {
     // .env.local not found, skip
   }
 }
+
+// The deployment's model configuration is loaded once per process and kept on
+// globalThis (lib/server/model-config/runtime.ts), which vi.resetModules does
+// not clear. Each test starts without it, so it is read from that test's env.
+beforeEach(() => {
+  delete (globalThis as Record<symbol, unknown>)[Symbol.for('openmaic.model-config.deployment')];
+});
+
+/**
+ * Suites fake the product's event streams by stubbing the global `EventSource`.
+ * While one is stubbed, a stream the product opens lands on the fake; otherwise
+ * the real class runs, on whatever `fetch` the suite provides.
+ */
+vi.mock('@/lib/utils/fetch-event-source', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/utils/fetch-event-source')>();
+  return {
+    ...actual,
+    FetchEventSource: new Proxy(actual.FetchEventSource, {
+      construct(target, args: [string], newTarget) {
+        const stub = (globalThis as { EventSource?: new (url: string) => object }).EventSource;
+        return stub ? new stub(...args) : Reflect.construct(target, args, newTarget);
+      },
+    }),
+  };
+});

@@ -8,6 +8,9 @@
  * `Last-Event-ID`, browser also has it) never double-appends.
  */
 import { describe, expect, it } from 'vitest';
+import { ContextBudgetError } from '@/lib/agent/runtime/context-budget-error';
+import { createWorkbenchTranslator } from '@/lib/i18n/workbench';
+import { presentSystemNotice } from '@/components/workbench/chat/system-notice';
 
 import {
   compactReplayEvents,
@@ -40,6 +43,7 @@ const blankFold: WorkbenchFold = {
   pages: {},
   chat: [],
   libraryRevision: 0,
+  materialLibraryRevision: 0,
   stageLinkStageIds: [],
   touchedStageIds: [],
   runCourseStageIds: [],
@@ -68,6 +72,79 @@ const assistantMessage = (parts: { type: string; text?: string; thinking?: strin
 const contentOf = (state: WorkbenchFold) => state.chat.filter((n) => n.kind !== 'waiting');
 
 describe('lifecycle events', () => {
+  it.each([
+    'summary_failed',
+    'no_compaction_boundary',
+    'still_oversized',
+    'invalid_output_budget',
+  ] as const)('replays %s as localized copy without a retry hint or technical code', (reason) => {
+    const error = new ContextBudgetError(reason).message;
+    const events = [
+      ev('session_start', { prompt: 'keep my request' }),
+      ev('message_end', {
+        message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: error },
+      }),
+      ev('session_end', { status: 'failed', error, errorCode: 'CONTEXT_BUDGET_EXCEEDED' }),
+    ];
+    const state = foldAll(events);
+    const node = state.chat.find((n) => n.kind === 'system')!;
+    const invalid = reason === 'invalid_output_budget';
+    for (const locale of ['en-US', 'zh-CN', 'unknown-locale']) {
+      const notice = presentSystemNotice(node, createWorkbenchTranslator(locale));
+      expect(notice.summary).toBe(
+        locale === 'zh-CN'
+          ? invalid
+            ? '当前模型的上下文预算配置异常，本轮已停止'
+            : '您已达到此会话的长度上限，可以开始新聊天以继续对话'
+          : invalid
+            ? "The current model's context budget is misconfigured. This turn has been stopped"
+            : "You've reached the maximum length for this conversation, but you can keep talking by starting a new chat",
+      );
+      expect(notice.hint).toBeUndefined();
+      expect(notice.detail).toBeUndefined();
+    }
+    expect(state.status).toBe('failed');
+    expect(state.generationOpen).toBe(false);
+    expect(state.chat).toContainEqual(
+      expect.objectContaining({ kind: 'user', text: 'keep my request' }),
+    );
+    expect(foldAll(events).chat).toEqual(state.chat);
+  });
+
+  it('silently clears a deleted Skill binding without changing the conversation or course', () => {
+    const initial = foldAll([
+      ev('session_start', { prompt: 'Keep this conversation' }),
+      ev('tool_execution_start', {
+        toolCallId: 'skill-read',
+        toolName: 'read',
+        args: { path: 'skill://usk_deleted/SKILL.md' },
+      }),
+      ev('tool_execution_end', {
+        toolCallId: 'skill-read',
+        toolName: 'read',
+        isError: false,
+        result: {
+          content: [{ type: 'text', text: 'Original Skill instructions' }],
+          details: { skill: 'usk_deleted' },
+        },
+      }),
+    ]);
+    initial.skillId = 'usk_deleted';
+    initial.stageId = 'saved-course';
+    const receipt = ev('skill_detached', {});
+    const next = foldEvent(initial, receipt);
+    expect(next.skillId).toBeNull();
+    expect(next.stageId).toBe('saved-course');
+    expect(next.status).toBe('running');
+    expect(next.chat).toContainEqual(
+      expect.objectContaining({ kind: 'user', text: 'Keep this conversation' }),
+    );
+    expect(next.chat).toEqual(initial.chat);
+    expect(next.chat).toContainEqual(
+      expect.objectContaining({ kind: 'tool', toolName: 'read', toolState: 'done' }),
+    );
+    expect(foldEvent(next, receipt)).toEqual(next);
+  });
   it('session_start opens the run with the user prompt and nothing else', () => {
     const state = foldAll([ev('session_start', { prompt: '给我讲讲光的折射', workerId: 'w1' })]);
     expect(state.status).toBe('running');
@@ -267,6 +344,34 @@ describe('lifecycle events', () => {
     expect(contentOf(state).map((n) => n.kind)).toEqual(['user']);
     // And it says nothing about a stage link; that is a separate event.
     expect(state.stageId).toBeNull();
+  });
+
+  it('library_changed of the material library counts on its own counter, never the course tree’s', () => {
+    let state = foldAll([ev('session_start', { prompt: 'p' })]);
+    state = foldEvent(
+      state,
+      ev('library_changed', { library: 'materials', change: 'folder_created', folderId: 'mf1' }),
+    );
+    state = foldEvent(
+      state,
+      ev('library_changed', {
+        library: 'materials',
+        change: 'materials_moved',
+        materialIds: ['m1'],
+        folderId: null,
+      }),
+    );
+    expect(state.materialLibraryRevision).toBe(2);
+    expect(state.libraryRevision).toBe(0);
+    expect(state.stageLinkStageIds).toEqual([]);
+    // A course write leaves the material counter alone.
+    state = foldEvent(
+      state,
+      ev('library_changed', { change: 'stage_created', stageId: 'stage-day-1', title: 'Day 1' }),
+    );
+    expect(state.materialLibraryRevision).toBe(2);
+    expect(state.libraryRevision).toBe(1);
+    expect(contentOf(state).map((n) => n.kind)).toEqual(['user']);
   });
 
   it('remembers WHICH stages the run created, in creation order (one tab each)', () => {

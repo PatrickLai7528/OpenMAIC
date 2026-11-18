@@ -14,7 +14,9 @@ import type {
   SlideContent,
 } from '@openmaic/dsl';
 import puppeteer from 'puppeteer-core';
-import type { Browser, Frame, Page } from 'puppeteer-core';
+import type { Browser, Frame, HTTPRequest, Page } from 'puppeteer-core';
+import { katexPreviewStylesheet } from './preview-katex.js';
+import { UNTRUSTED_HTML_CSP, injectUntrustedHtmlCsp } from './untrusted-html-csp.js';
 
 export type PreviewScene = Scene<
   Action,
@@ -57,9 +59,10 @@ function escapeAttribute(value: string): string {
     .replaceAll('>', '&gt;');
 }
 
-function htmlDocument(body: string, scene: PreviewScene): string {
+/** The stylesheet text is trusted (read from the installed KaTeX package). */
+function htmlDocument(body: string, scene: PreviewScene, headStyles = ''): string {
   return `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}</style></head>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}</style>${headStyles ? `<style data-preview-katex>${headStyles}</style>` : ''}</head>
 <body data-scene-id="${escapeAttribute(scene.id)}">${body}</body></html>`;
 }
 
@@ -135,6 +138,15 @@ export function injectInteractiveStorageShim(html: string): string {
   return injectIntoDocumentHead(html, `\n${STORAGE_SHIM}\n`);
 }
 
+/**
+ * Build the interactive `srcDoc`: the CSP `<meta>` first, then the storage
+ * shim. The policy must be processed before any authored script, including one
+ * placed before `<head>` or before `<html>`.
+ */
+export function buildInteractiveSrcDoc(html: string): string {
+  return injectInteractiveStorageShim(injectUntrustedHtmlCsp(html, UNTRUSTED_HTML_CSP));
+}
+
 function slidePreviewMarkup(
   _scene: Extract<PreviewScene, { type: 'slide' }>,
   viewport: PreviewViewport,
@@ -155,7 +167,7 @@ function interactivePreviewMarkup(
   return renderToStaticMarkup(
     createElement('iframe', {
       title: scene.title,
-      srcDoc: injectInteractiveStorageShim(scene.content.html),
+      srcDoc: buildInteractiveSrcDoc(scene.content.html),
       sandbox: 'allow-scripts allow-forms allow-modals',
       style: { width: `${viewport.width}px`, height: `${viewport.height}px`, border: 0 },
     }),
@@ -232,7 +244,8 @@ export function buildPreviewHtml(
       : scene.type === 'interactive'
         ? interactivePreviewMarkup(scene, viewport)
         : coverPreviewMarkup(scene, stage, viewport);
-  return htmlDocument(markup, scene);
+  // Slides typeset formulas as KaTeX HTML, which needs KaTeX's CSS and fonts.
+  return htmlDocument(markup, scene, scene.type === 'slide' ? katexPreviewStylesheet() : '');
 }
 
 let slideClientBundle: Promise<string> | undefined;
@@ -249,7 +262,7 @@ export function buildSlideClientBundle(builder: SlideBundleBuilder = build): Pro
         import React from 'react';
         import { flushSync } from 'react-dom';
         import { createRoot } from 'react-dom/client';
-        import { SlideCanvas } from '@openmaic/renderer';
+        import { SlideCanvas, completeInlineMath } from '@openmaic/renderer';
 
         const props = window.__OPENMAIC_PREVIEW_PROPS__;
         const root = document.getElementById('preview-slide-root');
@@ -280,6 +293,9 @@ export function buildSlideClientBundle(builder: SlideBundleBuilder = build): Pro
           style: { width: renderedWidth + 'px', height: renderedHeight + 'px' },
         }, canvasNode));
         flushSync(() => createRoot(root).render(frame));
+        // The live renderer typesets inline formulas within a per-pass budget
+        // and leaves the rest to idle time; a capture needs all of them now.
+        completeInlineMath(root);
         window.__OPENMAIC_PREVIEW_MOUNTED__ = true;
       `,
     },
@@ -305,23 +321,25 @@ type AssetDocument = Page | Frame;
 
 /** Wait for fonts, images, client effects, and layout mutations to settle. */
 export async function waitForDocumentAssets(document: AssetDocument): Promise<void> {
-  await document.evaluate(async () => {
+  // tsx/esbuild can add module-scoped helpers to nested functions. Keep the
+  // browser program as source so Page and Frame evaluate it without those closures.
+  await document.evaluate(`(async () => {
     await globalThis.document.fonts?.ready.catch(() => undefined);
     await Promise.all(
       Array.from(globalThis.document.images, (image) =>
         image.complete
           ? Promise.resolve()
-          : new Promise<void>((resolve) => {
+          : new Promise((resolve) => {
               image.addEventListener('load', () => resolve(), { once: true });
               image.addEventListener('error', () => resolve(), { once: true });
               setTimeout(resolve, 2_000);
             }),
       ),
     );
-    await new Promise<void>((resolve) =>
+    await new Promise((resolve) =>
       requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
     );
-    await new Promise<void>((resolve) => {
+    await new Promise((resolve) => {
       let quietTimer = setTimeout(done, 100);
       const maximumTimer = setTimeout(done, 2_000);
       const observer = new MutationObserver(() => {
@@ -340,7 +358,7 @@ export async function waitForDocumentAssets(document: AssetDocument): Promise<vo
         subtree: true,
       });
     });
-  });
+  })()`);
 }
 
 /** Wait for a srcDoc iframe and the assets inside its browsing context. */
@@ -356,6 +374,67 @@ export async function waitForInteractiveFrame(page: Page): Promise<void> {
 
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error('Preview aborted');
+}
+
+/**
+ * Schemes a request from inside the untrusted frame may still use. They carry
+ * data with the document rather than reaching the network, so the injected CSP
+ * already allows them and interception stays a defense-in-depth layer.
+ */
+const SUBFRAME_ALLOWED_PROTOCOLS = new Set(['data:', 'blob:', 'about:']);
+
+/** The `setContent` document loads as `about:blank`; nothing else may replace it. */
+const MAIN_FRAME_NAVIGATION_PROTOCOLS = new Set(['about:']);
+
+function requestProtocol(url: string): string {
+  try {
+    return new URL(url).protocol;
+  } catch {
+    return '';
+  }
+}
+
+/** Resolve one intercepted request exactly once, never letting a page hang. */
+function settleRequest(request: HTTPRequest, allow: boolean): void {
+  try {
+    if (request.isInterceptResolutionHandled()) return;
+    const action = allow ? request.continue() : request.abort('blockedbyclient');
+    void action.catch(() => {});
+  } catch {
+    // The request can already be gone (detached frame, aborted navigation).
+  }
+}
+
+/**
+ * Puppeteer-level counterpart to the injected CSP. The main frame keeps loading
+ * its own preview resources (slide images and the client bundle are
+ * deliberately untouched), while every request from the untrusted interactive
+ * frame and anything nested inside it is aborted unless it is a local scheme.
+ * Main-frame navigation away from the `setContent` document is blocked too.
+ *
+ * Returns a disposer to detach the handler.
+ */
+export async function installPreviewRequestGuard(page: Page): Promise<() => void> {
+  const mainFrame = page.mainFrame();
+  const handler = (request: HTTPRequest): void => {
+    let allow = false;
+    try {
+      if (request.frame() === mainFrame) {
+        allow =
+          !request.isNavigationRequest() ||
+          MAIN_FRAME_NAVIGATION_PROTOCOLS.has(requestProtocol(request.url()));
+      } else {
+        allow = SUBFRAME_ALLOWED_PROTOCOLS.has(requestProtocol(request.url()));
+      }
+    } catch {
+      allow = false;
+    }
+    settleRequest(request, allow);
+  };
+
+  await page.setRequestInterception(true);
+  page.on('request', handler);
+  return () => page.off('request', handler);
 }
 
 async function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -403,7 +482,9 @@ async function launchWithAbort(launch: Promise<Browser>, signal: AbortSignal): P
     return await raceWithAbort(launch, signal);
   } catch (error) {
     if (signal.aborted) {
-      void launch
+      // Keep the caller's execution permit until the launch settles and any
+      // browser it returns is closed; abort must not start background Chromiums.
+      await launch
         .then(async (browser) => {
           forceKillBrowser(browser);
           await closeBrowserBounded(browser);
@@ -460,6 +541,8 @@ export class ChromiumPreviewRenderer implements PreviewRenderer {
       this.browserLauncher.launch({
         executablePath,
         headless: true,
+        signal: request.signal,
+        timeout: request.deadlineMs,
         protocolTimeout: request.deadlineMs + PREVIEW_PROTOCOL_TIMEOUT_BUFFER_MS,
         args: ['--no-sandbox', '--disable-dev-shm-usage'],
       }),
@@ -473,38 +556,46 @@ export class ChromiumPreviewRenderer implements PreviewRenderer {
         (async () => {
           const page = await browser.newPage();
           await page.setViewport(request.viewport);
-          await page.setContent(buildPreviewHtml(request.scene, request.stage, request.viewport), {
-            waitUntil: 'domcontentloaded',
-          });
-
-          if (request.scene.type === 'slide') {
-            await page.evaluate(
-              (slide, viewport) => {
-                Object.assign(window, {
-                  __OPENMAIC_PREVIEW_PROPS__: { slide, viewport },
-                });
+          const removeRequestGuard = await installPreviewRequestGuard(page);
+          try {
+            await page.setContent(
+              buildPreviewHtml(request.scene, request.stage, request.viewport),
+              {
+                waitUntil: 'domcontentloaded',
               },
-              request.scene.content.canvas,
-              request.viewport,
             );
-            await mountSlideClient(page, await buildSlideClientBundle());
-          }
 
-          const selected = await page.evaluate(
-            (sceneId) => document.body.getAttribute('data-scene-id') === sceneId,
-            request.scene.id,
-          );
-          if (!selected) {
-            throw new Error(
-              `Requested scene was not found in the preview page (${request.scene.id})`,
+            if (request.scene.type === 'slide') {
+              await page.evaluate(
+                (slide, viewport) => {
+                  Object.assign(window, {
+                    __OPENMAIC_PREVIEW_PROPS__: { slide, viewport },
+                  });
+                },
+                request.scene.content.canvas,
+                request.viewport,
+              );
+              await mountSlideClient(page, await buildSlideClientBundle());
+            }
+
+            const selected = await page.evaluate(
+              (sceneId) => document.body.getAttribute('data-scene-id') === sceneId,
+              request.scene.id,
             );
+            if (!selected) {
+              throw new Error(
+                `Requested scene was not found in the preview page (${request.scene.id})`,
+              );
+            }
+
+            if (request.scene.type === 'interactive') await waitForInteractiveFrame(page);
+            else await waitForDocumentAssets(page);
+
+            const png = await page.screenshot({ type: 'png', optimizeForSpeed: true });
+            return new Uint8Array(png);
+          } finally {
+            removeRequestGuard();
           }
-
-          if (request.scene.type === 'interactive') await waitForInteractiveFrame(page);
-          else await waitForDocumentAssets(page);
-
-          const png = await page.screenshot({ type: 'png', optimizeForSpeed: true });
-          return new Uint8Array(png);
         })(),
         request.signal,
       );

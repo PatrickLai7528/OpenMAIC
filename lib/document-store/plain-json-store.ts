@@ -1,6 +1,10 @@
-import type { DocumentStore } from '@openmaic/storage';
+import type { DocumentStore, HttpDocumentWriteOptions } from '@openmaic/storage';
 
 import type { AppScene } from '@/lib/types/stage';
+import type {
+  CreateOnlyDocumentStore,
+  MutationOptions,
+} from '@/lib/persistence/owner-bound-document-store';
 import { omitUndefinedObjectMembers } from '@/lib/persistence/plain-json';
 
 import type { AppStage } from './persistence-types';
@@ -37,11 +41,24 @@ export function withPlainJsonDocumentWrites<TStore extends DocumentStore<AppScen
     deleteDocument(stageId) {
       return store.deleteDocument(stageId);
     },
-    putStage(stageId, stage) {
-      return store.putStage(stageId, omitUndefinedObjectMembers(stage));
+    putStage(stageId, stage, ...options: [HttpDocumentWriteOptions?]) {
+      // The HTTP store's row writes take request options (keepalive on unload).
+      return (store.putStage as (...args: unknown[]) => Promise<void>).call(
+        store,
+        stageId,
+        omitUndefinedObjectMembers(stage),
+        ...options,
+      );
     },
-    putScene(stageId, scene) {
-      return store.putScene(stageId, omitUndefinedObjectMembers(scene));
+    putScene(stageId, scene, ...options: [(MutationOptions | HttpDocumentWriteOptions)?]) {
+      // The owner-bound store's scene write takes options (its transaction's own
+      // rows); the HTTP store's takes request options (keepalive on unload).
+      return (store.putScene as (...args: unknown[]) => Promise<void>).call(
+        store,
+        stageId,
+        omitUndefinedObjectMembers(scene),
+        ...options,
+      );
     },
     getScene(stageId, sceneId) {
       return store.getScene(stageId, sceneId);
@@ -50,6 +67,32 @@ export function withPlainJsonDocumentWrites<TStore extends DocumentStore<AppScen
       return store.deleteScene(stageId, sceneId);
     },
   };
+  // The create-only write of the owner-bound store, when the store has one.
+  const createOnly = store as Partial<CreateOnlyDocumentStore<AppScene, AppStage>>;
+  if (typeof createOnly.mutateScene === 'function') {
+    const mutateScene = createOnly.mutateScene.bind(store);
+    Object.assign(methods, {
+      mutateScene: (...[stageId, sceneId, mutate, after]: Parameters<typeof mutateScene>) =>
+        mutateScene(
+          stageId,
+          sceneId,
+          (scene) => {
+            const next = mutate(scene);
+            return next ? omitUndefinedObjectMembers(next) : null;
+          },
+          after,
+        ),
+    });
+  }
+  if (typeof createOnly.createDocument === 'function') {
+    const createDocument = createOnly.createDocument.bind(store);
+    Object.assign(methods, {
+      createDocument: (
+        document: Parameters<typeof createDocument>[0],
+        options?: Parameters<typeof createDocument>[1],
+      ) => createDocument(omitUndefinedObjectMembers(document), options),
+    });
+  }
   const facade = Object.create(Object.getPrototypeOf(store)) as TStore;
   Object.defineProperties(facade, Object.getOwnPropertyDescriptors(methods));
   const wrapper = new Proxy(facade, {

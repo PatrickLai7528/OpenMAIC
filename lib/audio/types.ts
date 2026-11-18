@@ -10,6 +10,7 @@
  * - GLM TTS (https://docs.bigmodel.cn/cn/guide/models/sound-and-video/glm-tts)
  * - Qwen TTS (https://bailian.console.aliyun.com/)
  * - Doubao TTS (https://www.volcengine.com/docs/6561/1257543)
+ * - Google Gemini TTS (https://ai.google.dev/gemini-api/docs/speech-generation)
  * - Browser Native TTS (Web Speech API, client-side only)
  *
  * Currently Supported ASR Providers:
@@ -69,6 +70,8 @@
  *    providerElevenLabsTTS: 'ElevenLabs TTS' / 'ElevenLabs Text-to-Speech'
  */
 
+import type { VoiceDesign } from '@/lib/audio/voice-design';
+
 // ============================================================================
 // TTS (Text-to-Speech) Types
 // ============================================================================
@@ -88,6 +91,9 @@ export type BuiltInTTSProviderId =
   | 'doubao-tts'
   | 'elevenlabs-tts'
   | 'minimax-tts'
+  | 'xiaomi-tts'
+  | 'deepseek-tts'
+  | 'google-tts'
   | 'lemonade-tts'
   | 'browser-native-tts';
 
@@ -138,11 +144,31 @@ export interface TTSProviderConfig {
   defaultModelId: string;
   voices: TTSVoiceInfo[];
   supportedFormats: string[]; // ['mp3', 'wav', 'opus', etc.]
+  /**
+   * The request path under `defaultBaseUrl` the provider posts to, shown in
+   * the settings request-URL hint. Omitted when there is no single fixed
+   * path.
+   */
+  endpointPath?: string;
   speedRange?: {
     min: number;
     max: number;
     default: number;
   };
+  /**
+   * `false` when the provider ignores the requested speed, which locks the speed
+   * control in settings. Omitted means speed is supported; a missing
+   * `speedRange` does not imply the opposite.
+   */
+  supportsSpeed?: boolean;
+}
+
+/** A speaking agent, as a provider that designs voices may read it. */
+export interface TTSSpeaker {
+  name?: string;
+  role?: string;
+  persona?: string;
+  voiceDesign?: VoiceDesign;
 }
 
 /**
@@ -154,9 +180,17 @@ export interface TTSModelConfig {
   apiKey?: string;
   baseUrl?: string;
   voice: string;
+  /** Provider-local ordinary voices, resolved from stored server configuration. */
+  voices?: ConfiguredTTSVoice[];
   speed?: number;
   format?: string;
   providerOptions?: Record<string, unknown>;
+  /**
+   * Who is speaking, for a provider that designs a voice from a description
+   * when no voice of its own was chosen. The browser sends that description in
+   * `providerOptions`; a server-side caller passes the speaker instead.
+   */
+  speaker?: TTSSpeaker;
   /**
    * Cancel the provider request(s) when this signal aborts. The agent runtime
    * threads the session cancel signal here so an in-flight synthesis fetch is
@@ -164,6 +198,22 @@ export interface TTSModelConfig {
    * restart repairs it.
    */
   signal?: AbortSignal;
+  /**
+   * Server-side outbound address policy for this provider call. `true` marks a
+   * client-supplied BYOK `baseUrl`: the request is pinned to the strict public
+   * policy, so metadata, private, loopback and CGNAT targets are refused even
+   * when the operator enabled local networks. When unset (a server-managed or
+   * built-in default target) the adapter falls back to the process-wide
+   * `ALLOW_LOCAL_NETWORKS` behavior.
+   */
+  publicOnly?: boolean;
+  /**
+   * `true` when the provider is server-configured: its endpoint is operator
+   * configuration and may be on a local network without ALLOW_LOCAL_NETWORKS
+   * (cloud metadata stays refused). Set by the server, never from request
+   * input; an unmanaged provider's catalog default leaves it unset.
+   */
+  managed?: boolean;
 }
 
 // ============================================================================
@@ -182,7 +232,9 @@ export type BuiltInASRProviderId =
   | 'qwen-asr'
   | 'funasr-asr'
   | 'lemonade-asr'
-  | 'azure-asr';
+  | 'azure-asr'
+  | 'xiaomi-asr'
+  | 'deepseek-asr';
 
 export type ASRProviderId = BuiltInASRProviderId | `custom-asr-${string}`;
 
@@ -199,6 +251,19 @@ export interface ASRProviderConfig {
   defaultModelId: string;
   supportedLanguages: string[];
   supportedFormats: string[];
+  /**
+   * The request path under `defaultBaseUrl` the provider posts to, shown in
+   * the settings request-URL hint. Omitted when there is no single fixed
+   * path.
+   */
+  endpointPath?: string;
+  /**
+   * The maximum ASR chunk duration (seconds) for server-side material
+   * extraction. Providers without a limit omit this and use the generic
+   * default. A provider whose input cap is a base64-encoded payload (e.g.
+   * Xiaomi MiMo's 10 MB input_audio limit) declares a lower bound here.
+   */
+  maxChunkSeconds?: number;
 }
 
 /**
@@ -210,14 +275,29 @@ export interface ASRModelConfig {
   apiKey?: string;
   baseUrl?: string;
   language?: string;
+  /**
+   * Server-side outbound address policy (see {@link TTSModelConfig.publicOnly}).
+   * A client-supplied BYOK `baseUrl` sets this so the strict public policy wins.
+   */
+  publicOnly?: boolean;
+  /** Server-configured provider (see {@link TTSModelConfig.managed}). */
+  managed?: boolean;
 }
 
 /** Returns true if the provider ID is a user-defined custom TTS provider. */
 export function isCustomTTSProvider(id: string): boolean {
-  return id.startsWith('custom-tts-');
+  return typeof id === 'string' && id.startsWith('custom-tts-');
 }
 
 /** Returns true if the provider ID is a user-defined custom ASR provider. */
 export function isCustomASRProvider(id: string): boolean {
-  return id.startsWith('custom-asr-');
+  return typeof id === 'string' && id.startsWith('custom-asr-');
+}
+
+/** A provider-local voice catalogue configured by the deployment. */
+export interface ConfiguredTTSVoice {
+  id: string;
+  name: string;
+  language?: string;
+  gender?: 'male' | 'female' | 'neutral';
 }

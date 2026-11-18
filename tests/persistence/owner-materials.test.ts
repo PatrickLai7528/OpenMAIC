@@ -1,16 +1,26 @@
 import { PGlite } from '@electric-sql/pglite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ConnectableQueryable } from '@openmaic/storage/server/reference';
-
+import { ensureAssetSchema } from '@openmaic/storage/asset/pg';
 import {
+  nodePostgresTransaction,
+  type ConnectableQueryable,
+} from '@openmaic/storage/server/reference';
+
+import { OwnerRetiredError } from '@/lib/persistence/owner-merges';
+import {
+  deleteOwnerMaterial,
+  sweepUnusedOwnerMaterials,
   ensureOwnerMaterialSchema,
+  getReadyOwnerMaterials,
   finalizeOwnerMaterial,
   ownerMaterialQuotaLockKey,
   reclaimStaleOwnerMaterialUploads,
   registerOwnerMaterial,
   type RegisterOwnerMaterialInput,
 } from '@/lib/persistence/owner-materials';
+
+import { UPGRADE_SCENARIOS } from './_owner-material-upgrade-scenarios';
 
 /** The node-postgres pool surface, backed by the single-connection PGlite. */
 class PGlitePool {
@@ -96,7 +106,15 @@ describe('owner material reservations', () => {
     const db = new PGlite();
     await db.waitReady;
     await ensureOwnerMaterialSchema(db);
+    // The uploading-row deletes withdraw material roots, which live there.
+    await ensureAssetSchema(db);
     pool = new PGlitePool(db);
+  });
+
+  /** What the reclaim needs of the provider: the pool and its transactions. */
+  const persistence = () => ({
+    pool: pool as never,
+    withTransaction: nodePostgresTransaction(pool as unknown as ConnectableQueryable),
   });
 
   afterEach(async () => {
@@ -122,6 +140,25 @@ describe('owner material reservations', () => {
     expect(lockStatement).toBeGreaterThanOrEqual(0);
     expect(usageStatement).toBeGreaterThan(lockStatement);
     expect(insertStatement).toBeGreaterThan(usageStatement);
+  });
+
+  it('stores extraction metadata containing NUL and lone surrogates', async () => {
+    const record = await registerOwnerMaterial(
+      pool as unknown as ConnectableQueryable,
+      input({
+        extraction: {
+          status: 'failed',
+          error: `bad\u0000diag bad\uD800diag`,
+          extractor: '\u{1F600}',
+        },
+      }),
+      { maxCount: 10, maxTotalBytes: 1_000 },
+    );
+    expect(record.extraction).toEqual({
+      status: 'failed',
+      error: 'bad\uFFFDdiag bad\uFFFDdiag',
+      extractor: '\u{1F600}',
+    });
   });
 
   it('rejects a reservation when the owner count quota is already spent', async () => {
@@ -197,11 +234,7 @@ describe('owner material reservations', () => {
       expect(objectKey).toBe('materials/owner-1/mat-crash');
     });
 
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
 
     expect(deleteBytes).toHaveBeenCalledTimes(1);
     expect(deleteBytes).toHaveBeenCalledWith('materials/owner-1/mat-crash');
@@ -220,19 +253,11 @@ describe('owner material reservations', () => {
       .mockRejectedValueOnce(new Error('registry unavailable'))
       .mockResolvedValue(undefined);
 
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
     // First pass: removal failed, so the reservation stays for the next pass.
     expect(await rowById(pool.db, 'mat_stale')).not.toBeNull();
 
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
     expect(deleteBytes).toHaveBeenCalledTimes(2);
     expect(await rowById(pool.db, 'mat_stale')).toBeNull();
   });
@@ -245,11 +270,7 @@ describe('owner material reservations', () => {
     });
 
     const deleteBytes = vi.fn().mockResolvedValue(undefined);
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
 
     expect(deleteBytes).not.toHaveBeenCalled();
     expect(await rowById(pool.db, 'mat_empty')).toBeNull();
@@ -265,15 +286,119 @@ describe('owner material reservations', () => {
     });
 
     const deleteBytes = vi.fn().mockResolvedValue(undefined);
-    await reclaimStaleOwnerMaterialUploads(
-      pool as unknown as ConnectableQueryable,
-      'owner-1',
-      deleteBytes,
-    );
+    await reclaimStaleOwnerMaterialUploads(persistence(), 'owner-1', deleteBytes);
 
     expect(deleteBytes).not.toHaveBeenCalled();
     expect(await rowById(pool.db, 'mat_fresh')).toMatchObject({ status: 'uploading' });
     expect(await rowById(pool.db, 'mat_old_ready')).toMatchObject({ status: 'ready' });
+  });
+
+  it('deletes an owned ready material: releases quota, then bytes, then the row', async () => {
+    const limits = { maxCount: 1, maxTotalBytes: 1_000 };
+    await insertRawUpload(pool.db, {
+      id: 'mat_ready',
+      ossKey: 'materials/owner-1/mat_ready',
+      status: 'ready',
+    });
+
+    const deleteBytes = vi.fn(async () => {
+      // The id stops resolving before the bytes go, and the row (the pointer)
+      // outlives the byte deletion.
+      expect(
+        await getReadyOwnerMaterials(pool as unknown as ConnectableQueryable, 'owner-1', [
+          'mat_ready',
+        ]),
+      ).toEqual([]);
+      expect(await rowById(pool.db, 'mat_ready')).not.toBeNull();
+    });
+    await expect(
+      deleteOwnerMaterial(
+        pool as unknown as ConnectableQueryable,
+        'owner-1',
+        'mat_ready',
+        deleteBytes,
+      ),
+    ).resolves.toBe(true);
+
+    expect(deleteBytes).toHaveBeenCalledWith('materials/owner-1/mat_ready');
+    expect(await rowById(pool.db, 'mat_ready')).toBeNull();
+    // The quota slot is free again.
+    await expect(
+      registerOwnerMaterial(pool as unknown as ConnectableQueryable, input(), limits),
+    ).resolves.toMatchObject({ id: 'mat_1' });
+  });
+
+  it('refuses foreign, unknown and unfinished materials alike', async () => {
+    await insertRawUpload(pool.db, {
+      id: 'mat_other',
+      ownerId: 'owner-2',
+      ossKey: 'materials/owner-2/mat_other',
+      status: 'ready',
+    });
+    await insertRawUpload(pool.db, { id: 'mat_uploading', ossKey: 'materials/owner-1/up' });
+    const deleteBytes = vi.fn();
+
+    for (const id of ['mat_other', 'mat_missing', 'mat_uploading']) {
+      await expect(
+        deleteOwnerMaterial(pool as unknown as ConnectableQueryable, 'owner-1', id, deleteBytes),
+      ).resolves.toBe(false);
+    }
+    expect(deleteBytes).not.toHaveBeenCalled();
+    expect(await rowById(pool.db, 'mat_other')).toMatchObject({ status: 'ready' });
+    expect(await rowById(pool.db, 'mat_uploading')).toMatchObject({ status: 'uploading' });
+  });
+
+  it('refuses to delete for a retired owner, behind the owner write fence', async () => {
+    const anonymousOwner = 'anon:0f8fad5b-d9cb-469f-a165-70867728950e';
+    await insertRawUpload(pool.db, {
+      id: 'mat_ready',
+      ownerId: anonymousOwner,
+      ossKey: 'materials/anon/mat_ready',
+      status: 'ready',
+    });
+    await pool.db.query(
+      `INSERT INTO owner_merges (from_owner_id, to_owner_id) VALUES ($1, 'user-1')`,
+      [anonymousOwner],
+    );
+    const deleteBytes = vi.fn();
+
+    await expect(
+      deleteOwnerMaterial(
+        pool as unknown as ConnectableQueryable,
+        anonymousOwner,
+        'mat_ready',
+        deleteBytes,
+      ),
+    ).rejects.toBeInstanceOf(OwnerRetiredError);
+    expect(deleteBytes).not.toHaveBeenCalled();
+    expect(await rowById(pool.db, 'mat_ready')).toMatchObject({ status: 'ready' });
+  });
+
+  it('retries explicit byte deletion through the sweep and retains its tombstone', async () => {
+    const limits = { maxCount: 1, maxTotalBytes: 1_000 };
+    await insertRawUpload(pool.db, {
+      id: 'mat_ready',
+      ossKey: 'materials/owner-1/mat_ready',
+      status: 'ready',
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await expect(
+      deleteOwnerMaterial(pool as unknown as ConnectableQueryable, 'owner-1', 'mat_ready', () =>
+        Promise.reject(new Error('store down')),
+      ),
+    ).resolves.toBe(true);
+    warn.mockRestore();
+    expect(await rowById(pool.db, 'mat_ready')).not.toBeNull();
+    // Deleted already: the quota is released even while the bytes remain.
+    await registerOwnerMaterial(pool as unknown as ConnectableQueryable, input(), limits);
+
+    const deleteBytes = vi.fn().mockResolvedValue(undefined);
+    await sweepUnusedOwnerMaterials(pool, { untouchedBefore: 0, deleteObjects: deleteBytes });
+    expect(deleteBytes).toHaveBeenCalledWith('materials/owner-1/mat_ready');
+    expect(await rowById(pool.db, 'mat_ready')).toMatchObject({ oss_key: '' });
+    // The fresh reservation is untouched.
+    expect(await rowById(pool.db, 'mat_1')).toMatchObject({ status: 'uploading' });
   });
 
   it('upgrades a table created by the asset-id era schema', async () => {
@@ -329,7 +454,7 @@ describe('owner material reservations', () => {
     );
     const names = columns.rows.map((row) => row.column_name);
     expect(names).toContain('oss_key');
-    expect(names).not.toContain('asset_id');
+    expect(names).toContain('asset_id');
     await oldPool.end();
   });
 
@@ -337,4 +462,21 @@ describe('owner material reservations', () => {
     expect(ownerMaterialQuotaLockKey('owner-1')).toBe('owner-materials:owner-1:quota');
     expect(ownerMaterialQuotaLockKey('owner-1')).not.toBe('owner-materials:owner-1');
   });
+});
+
+describe('owner material schema upgrades', () => {
+  // A PGlite database of its own per scenario: each one builds a different
+  // historical table shape before the bootstrap under test runs.
+  for (const [name, scenario] of Object.entries(UPGRADE_SCENARIOS)) {
+    it(name, async () => {
+      const db = new PGlite();
+      await db.waitReady;
+      const pool = new PGlitePool(db);
+      try {
+        await scenario({ db, pool: pool as unknown as ConnectableQueryable });
+      } finally {
+        await pool.end();
+      }
+    });
+  }
 });

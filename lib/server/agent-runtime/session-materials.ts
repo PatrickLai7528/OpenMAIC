@@ -19,14 +19,19 @@ import {
   type AgentSessionMeta,
   type ListAgentSessionMaterialsOptions,
 } from '@openmaic/storage';
-import { getReadyOwnerMaterials } from '@/lib/persistence/owner-materials';
+import {
+  attachOwnerMaterialsToSession,
+  ensureSessionMaterialLinkSchema,
+} from '@/lib/persistence/session-material-links';
 
 import { getServerPersistenceProvider } from '@/lib/persistence/server-provider';
 import { getMaterialByteStore } from '@/lib/server/materials/bytes';
 
 import { getAgentSessionStore } from './store';
-import { isPptxMaterial } from './pptx-mime';
 import type { ExtractedWebPage } from './fetch-url';
+import type { ConnectableQueryable } from '@openmaic/storage/server/reference';
+import type { Queryable } from '@openmaic/storage/document/pg';
+import { withSchemaBootstrapLock } from '@/lib/persistence/schema-bootstrap-lock';
 
 interface AgentSessionMaterialStoreState {
   connectionString?: string;
@@ -47,8 +52,13 @@ async function createMaterialStore(connectionString: string): Promise<PgAgentSes
   const { pool } = await getServerPersistenceProvider(connectionString);
   // The material table references agent_sessions(id), so the agent-session
   // schema (provisioned by getAgentSessionStore) must exist first — the same
+  await getAgentSessionStore();
   // dependency the URL trust-gate table has inside that schema.
-  await ensureAgentSessionMaterialSchema(pool);
+  await withSchemaBootstrapLock(pool as unknown as ConnectableQueryable, async (locked) => {
+    await ensureAgentSessionMaterialSchema(locked);
+    // Links reference agent_sessions too, and are read beside the copies.
+    await ensureSessionMaterialLinkSchema(locked);
+  });
   return new PgAgentSessionMaterialStore(pool);
 }
 
@@ -76,6 +86,20 @@ export function getAgentSessionMaterialStore(): Promise<PgAgentSessionMaterialSt
   });
   storeState.storePromise = initialization;
   return initialization;
+}
+
+/**
+ * The pool, once the session-material schema -- the links table included -- is
+ * provisioned. Every read or write of `agent_session_material_links` goes
+ * through here: on a database upgraded from before links, the table is
+ * created by this lazy bootstrap, and a query that did not wait for it would
+ * find no table.
+ */
+export async function getSessionMaterialQueryable(): Promise<Queryable> {
+  await getAgentSessionMaterialStore();
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) throw new Error('Agent runtime requires DATABASE_URL');
+  return (await getServerPersistenceProvider(connectionString)).pool;
 }
 
 function sessionMaterialPrefix(sessionId: string): string {
@@ -206,9 +230,19 @@ export async function createSourceMaterial(
 }
 
 /**
- * Bind owner-library uploads to a session by copying their private bytes into
- * the session byte prefix and creating the material rows the agent reads.
- * Rebinding the same id is idempotent.
+ * Attach owner-library sources to a session when a message is sent (RFC #1716
+ * §4): by id, through `agent_session_material_links`. Nothing is copied and no
+ * session row is minted; every consumer reads the source as it is now
+ * (`./material-resolver.ts`). A source the session already holds a copy of --
+ * from before links -- keeps that copy, so the conversation never lists one
+ * file twice. Repeating an attachment changes nothing.
+ *
+ * Refused as a whole, attaching nothing, unless every id is the owner's ready,
+ * undeleted source: another owner's, a derivative, an upload still in
+ * progress or a deleted one is `SessionMaterialBindingError`.
+ *
+ * Returns the id the conversation knows each material by (the source's own id
+ * for a link, the copy's id for a copy) with the metadata the message records.
  */
 export async function bindOwnerMaterialsToSession(
   sessionId: string,
@@ -217,50 +251,23 @@ export async function bindOwnerMaterialsToSession(
 ): Promise<Array<{ materialId: string; originalName?: string; mime?: string; bytes: number }>> {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) throw new Error('Agent runtime requires DATABASE_URL');
+  // The links table is provisioned with the session-material schema.
+  await getAgentSessionMaterialStore();
   const provider = await getServerPersistenceProvider(connectionString);
-  const records = await getReadyOwnerMaterials(provider.pool, ownerId, materialIds);
-  const byteStore = getMaterialByteStore();
-  const byId = new Map(records.map((record) => [record.id, record]));
-  if (materialIds.some((id) => !byId.has(id))) {
+  const outcome = await attachOwnerMaterialsToSession(provider, {
+    sessionId,
+    ownerId,
+    materialIds,
+  });
+  if (outcome.status !== 'attached') {
     throw new SessionMaterialBindingError('one or more materials are unavailable');
   }
-  const store = await getAgentSessionMaterialStore();
-  const bound = [];
-  for (const id of materialIds) {
-    const record = byId.get(id)!;
-    if (!(await store.getMaterial(sessionId, id))) {
-      let source: Buffer;
-      try {
-        source = await byteStore.get(record.ossKey);
-      } catch {
-        throw new SessionMaterialBindingError(`material ${id} bytes are unavailable`);
-      }
-      const mime = record.mime ?? 'application/octet-stream';
-      const rawObjectKey = sessionMaterialKey(sessionId, id, rawObjectName(mime));
-      await byteStore.put(rawObjectKey, source, mime);
-      try {
-        await store.createMaterial(sessionId, {
-          id,
-          kind: 'source',
-          title: record.originalName ?? id,
-          rawAssetId: rawObjectKey,
-          textChars: 0,
-        });
-      } catch (error) {
-        if (!(await store.getMaterial(sessionId, id))) {
-          await byteStore.delete(rawObjectKey).catch(() => undefined);
-          throw error;
-        }
-      }
-    }
-    bound.push({
-      materialId: id,
-      ...(record.originalName ? { originalName: record.originalName } : {}),
-      ...(record.mime ? { mime: record.mime } : {}),
-      bytes: record.bytes,
-    });
-  }
-  return bound;
+  return outcome.materials.map(({ materialId, record }) => ({
+    materialId,
+    ...(record.originalName ? { originalName: record.originalName } : {}),
+    ...(record.mime ? { mime: record.mime } : {}),
+    bytes: record.bytes,
+  }));
 }
 
 /**
@@ -372,32 +379,4 @@ export async function removeSessionMaterialRawAsset(
 ): Promise<void> {
   if (!isSessionMaterialKey(sessionId, rawAssetId)) return;
   await getMaterialByteStore().delete(rawAssetId);
-}
-
-/**
- * Safe metadata and typed-tool guidance for materials bound to one session.
- * Material contents stay in the byte store and are available only through
- * the session-scoped material tools, never through this block.
- */
-export function sessionMaterialsPromptBlock(materials: AgentSessionMaterial[]): string {
-  if (materials.length === 0) return '';
-
-  return [
-    '## Registered session materials',
-    '',
-    'These materials are associated with this session:',
-    ...materials.map(
-      (material) =>
-        `- "${material.title ?? material.id}" (${material.kind}, ${material.textChars} characters)`,
-    ),
-    '',
-    'Material workflow: call `list_materials` to inspect the session materials and discover `mat_` ids; call `extract_material` on an uploaded source, then `wait_for_materials`; call `read_material` on the resulting extraction `mat_` id to read its text in pages (continue with the returned `nextOffset`); call `search_material` to locate case-insensitive literal text across the readable materials.',
-    'To reuse session image, video, or audio bytes in a page, call `use_material_media` and use the returned stable `src`.',
-    'A `web` material was already fetched and extracted; read it directly with `read_material` and page through offsets.',
-    ...(materials.some((material) => isPptxMaterial({ originalName: material.title }))
-      ? [
-          'A registered .pptx can be imported INTO a stage as appended pages with `import_pptx` (layout-preserving: original slides become pages; the stage keeps its own title). Use that instead of an AI rewrite when the user wants the PowerPoint\u2019s own pages.',
-        ]
-      : []),
-  ].join('\n');
 }

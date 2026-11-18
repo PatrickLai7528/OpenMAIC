@@ -4,20 +4,24 @@
  * These handlers only use the durable session store. A separately running
  * worker claims queued sessions after the request has returned.
  */
+import { assertWorkspaceModelsAuthorized } from '@/lib/server/model-config/runtime';
 import type { NextRequest } from 'next/server';
 import { NextResponse } from 'next/server';
 
 import { isAgentRuntimeConfigured } from '@/lib/config/feature-flags';
 import { apiError } from '@/lib/server/api-response';
+import { supportedLocaleOf } from '@/lib/i18n/types';
 import { MAX_SESSION_TEXT_LENGTH } from '@/lib/server/agent-runtime/limits';
 import { findSkill, inferSkillIdFromPrompt, listSkills } from '@/lib/server/agent-runtime/skills';
 import { getAgentSessionStore } from '@/lib/server/agent-runtime/store';
+import { isPBLRoleSession } from '@/lib/pbl/v3/session-kind';
 import { scheduleConversationTitle } from '@/lib/server/agent-runtime/conversation-title-task';
 import {
   bindOwnerMaterialsToSession,
   SessionMaterialBindingError,
 } from '@/lib/server/agent-runtime/session-materials';
-import { withRequestOwnerId } from '@/lib/server/agent-runtime/with-owner';
+import { withRequestOwner } from '@/lib/server/identity/with-owner';
+import { ownerRetiredResponse, ownerWriteErrorResponse } from '@/lib/persistence/owner-merges';
 import { buildRequestOrigin, isValidClassroomId } from '@/lib/server/classroom-storage';
 import { decodeCourseRefs } from '@/lib/workbench/course-refs';
 
@@ -33,6 +37,8 @@ interface CreateSessionBody {
   materialIds?: unknown;
   /** Classrooms named on the opening message. */
   courseRefs?: unknown;
+  /** The interface language the conversation starts in; an unsupported value is ignored. */
+  locale?: unknown;
 }
 
 export async function POST(req: NextRequest) {
@@ -86,11 +92,22 @@ export async function POST(req: NextRequest) {
     );
   }
   const decodedCourseRefs = decodeCourseRefs(body.courseRefs ?? []);
+  // Only a supported code is kept: it names the copy the run's tools load.
+  const locale = supportedLocaleOf(body.locale);
   if (!decodedCourseRefs.ok) {
     return apiError('INVALID_REQUEST', 400, decodedCourseRefs.error);
   }
 
-  return withRequestOwnerId(req, async (ownerId, responseHeaders) => {
+  return withRequestOwner(req, async ({ ownerId }, responseHeaders) => {
+    await assertWorkspaceModelsAuthorized(ownerId, [
+      'agent',
+      'agent.title',
+      'image',
+      'video',
+      'tts',
+      'asr',
+      'webSearch',
+    ]);
     // An EXPLICIT skill — a `?skill=` launch link, not composer UI — is
     // rejected here rather than at claim time: a session created with a typo'd
     // skill would otherwise sit queued and then quietly build an ordinary
@@ -136,19 +153,35 @@ export async function POST(req: NextRequest) {
     // ownership validation is deferred until a later slice consumes stageId —
     // the upstream document store has no owner partition yet.
     const store = await getAgentSessionStore();
+    // A request still presenting an anonymous identity that was claimed into
+    // an account starts nothing under it (lib/persistence/owner-merges.ts).
+    if ((await store.readRetirement(ownerId)) !== null) {
+      return ownerRetiredResponse(responseHeaders);
+    }
     const hasOpeningContext = materialIds.length > 0 || decodedCourseRefs.refs.length > 0;
-    const meta = await store.createSession({
-      ownerId,
-      prompt,
-      ...(stageId ? { stageId } : {}),
-      ...(skillId ? { skillId } : {}),
-      existingCourse,
-      titleState: 'pending',
-      origin: buildRequestOrigin(req),
-      // Keep the runner from claiming the session until its opening materials
-      // and references are durable. postUserMessage below atomically requeues it.
-      ...(existingCourse || hasOpeningContext ? { status: 'succeeded' as const } : {}),
-    });
+    // A create racing a claim of this owner is written for the account, as if
+    // it had committed just before the claim (the store forwards under the
+    // owner's identity lock); a busy claim answers 503 OWNER_BUSY.
+    let meta: Awaited<ReturnType<typeof store.createSession>>;
+    try {
+      meta = await store.createSession({
+        ownerId,
+        prompt,
+        ...(stageId ? { stageId } : {}),
+        ...(skillId ? { skillId } : {}),
+        existingCourse,
+        titleState: 'pending',
+        origin: buildRequestOrigin(req),
+        ...(locale ? { locale } : {}),
+        // Keep the runner from claiming the session until its opening materials
+        // and references are durable. postUserMessage below atomically requeues it.
+        ...(existingCourse || hasOpeningContext ? { status: 'succeeded' as const } : {}),
+      });
+    } catch (error) {
+      const claimed = ownerWriteErrorResponse(error, responseHeaders);
+      if (claimed) return claimed;
+      throw error;
+    }
 
     if (!hasOpeningContext) {
       if (!existingCourse) scheduleConversationTitle(meta.id, ownerId);
@@ -166,6 +199,7 @@ export async function POST(req: NextRequest) {
           text: openingText,
           ...(materials.length ? { materials } : {}),
           ...(decodedCourseRefs.refs.length ? { courseRefs: decodedCourseRefs.refs } : {}),
+          ...(locale ? { locale } : {}),
         },
         { expectedOwnerId: ownerId },
       );
@@ -183,6 +217,8 @@ export async function POST(req: NextRequest) {
       if (error instanceof SessionMaterialBindingError) {
         return new Response('Not found', { status: 404, headers: responseHeaders });
       }
+      const claimed = ownerWriteErrorResponse(error, responseHeaders);
+      if (claimed) return claimed;
       throw error;
     }
   });
@@ -193,9 +229,12 @@ export async function GET(req: NextRequest) {
     return new Response('Not found', { status: 404 });
   }
 
-  return withRequestOwnerId(req, async (ownerId, responseHeaders) => {
+  return withRequestOwner(req, async ({ ownerId }, responseHeaders) => {
     const store = await getAgentSessionStore();
     const sessions = await store.listSessionsByOwner(ownerId);
-    return NextResponse.json(sessions, { headers: responseHeaders });
+    return NextResponse.json(
+      sessions.filter((session) => !isPBLRoleSession(session.id)),
+      { headers: responseHeaders },
+    );
   });
 }

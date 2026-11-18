@@ -4,8 +4,8 @@ import { useState, useCallback, useRef } from 'react';
 import { nanoid } from 'nanoid';
 import { toast } from 'sonner';
 import { useI18n } from '@/lib/hooks/use-i18n';
-import { db, mediaFileKey } from '@/lib/utils/database';
-import type { AudioFileRecord } from '@/lib/utils/database';
+import { db, mediaFileKey } from '@/lib/device-storage/database';
+import type { AudioFileRecord } from '@/lib/device-storage/database';
 import type { GeneratedAgentConfig } from '@/lib/types/stage';
 import {
   agentConfigFromManifest,
@@ -18,11 +18,28 @@ import { createLogger } from '@/lib/logger';
 import { canonicalizeLegacyScene, mutateDocument, type AppDocument } from '@/lib/document-store';
 import { isConcreteMediaAddress } from '@/lib/media/resolve-media-ref';
 import { isGeneratedMediaPlaceholder } from '@/lib/media/media-ref';
+import { putAsset } from '@/lib/media/asset-pool';
+import { isStorageFullFailure } from '@/lib/media/media-failure';
 import type JSZip from 'jszip';
-import type { Slide } from '@openmaic/dsl';
+import { installClassroomProjects } from '@/lib/pbl/v3/package-client';
+import type { AssetMeta, Slide } from '@openmaic/dsl';
 import type { Stage } from '@/lib/types/stage';
 
 const log = createLogger('ImportClassroom');
+
+async function allocateImportedAsset(blob: Blob, meta: AssetMeta): Promise<string> {
+  // A shared document must name stored bytes, not a browser-only cache key.
+  return putAsset(blob, meta);
+}
+
+async function writeImportedMediaCache(write: () => Promise<unknown>): Promise<void> {
+  try {
+    await write();
+  } catch (error) {
+    // The upload already succeeded; a cache failure only costs a re-download.
+    log.warn('Imported media cache write failed; keeping the server asset:', error);
+  }
+}
 
 export interface ImportedMediaMappings {
   readonly refToNewId: ReadonlyMap<string, string>;
@@ -204,7 +221,10 @@ export async function materializeImportedAudio(
     const zipEntry = zip.file(zipPath);
     if (!zipEntry) continue;
     const blob = await zipEntry.async('blob');
-    const audioId = nanoid();
+    const audioId = await allocateImportedAsset(blob, {
+      contentType: importedAudioContentType(meta, blob.type),
+      ...(meta.duration === undefined ? {} : { durationSeconds: meta.duration }),
+    });
     allocatedIds.push(audioId);
     pathToId.set(zipPath, audioId);
     const relativePath = zipPath.startsWith('audio/') ? zipPath.slice('audio/'.length) : zipPath;
@@ -224,12 +244,12 @@ export async function materializeImportedAudio(
       voice: meta.voice,
       createdAt,
     };
-    await db.audioFiles.put(record);
+    await writeImportedMediaCache(() => db.audioFiles.put(record));
   }
   return { pathToId, sourceRefToId };
 }
 
-/** Materialize imported media directly into the stage's Dexie byte rows. */
+/** Store archive bytes before returning the references the imported document will hold. */
 export async function materializeImportedMedia(
   zip: JSZip,
   manifest: ClassroomManifest,
@@ -268,22 +288,24 @@ export async function materializeImportedMedia(
     const posterEntry =
       type === 'video' ? zip.file(siblingPosterZipPath(zipPath, meta.mimeType)) : null;
     const posterBlob = posterEntry ? await posterEntry.async('blob') : undefined;
-    const mediaId = nanoid();
+    const mediaId = await allocateImportedAsset(blob, { contentType: mimeType });
     allocatedIds.push(mediaId);
     refToNewId.set(oldRef, mediaId);
 
-    await db.mediaFiles.put({
-      id: mediaFileKey(stageId, mediaId),
-      stageId,
-      type,
-      blob,
-      mimeType,
-      size: meta.size || blob.size,
-      poster: posterBlob,
-      prompt: meta.prompt || '',
-      params: '',
-      createdAt,
-    });
+    await writeImportedMediaCache(() =>
+      db.mediaFiles.put({
+        id: mediaFileKey(stageId, mediaId),
+        stageId,
+        type,
+        blob,
+        mimeType,
+        size: meta.size || blob.size,
+        poster: posterBlob,
+        prompt: meta.prompt || '',
+        params: '',
+        createdAt,
+      }),
+    );
     imported.push({ oldRef, assetId: mediaId, type, posterBlob, prompt: meta.prompt });
   }
 
@@ -292,24 +314,30 @@ export async function materializeImportedMedia(
   // only older ZIPs need an extra allocation for the sibling poster bytes.
   for (const entry of imported) {
     if (entry.type !== 'video' || !entry.posterBlob) continue;
+    const posterBlob = entry.posterBlob;
     const oldPosterRefs = posterRefsForMedia(manifest, entry.oldRef);
     let posterAssetId = oldPosterRefs
       .map((oldPosterRef) => mappedString(mappings.refToNewId, oldPosterRef))
       .find((value): value is string => typeof value === 'string');
     if (!posterAssetId) {
-      posterAssetId = nanoid();
-      allocatedIds.push(posterAssetId);
-      await db.mediaFiles.put({
-        id: mediaFileKey(stageId, posterAssetId),
-        stageId,
-        type: 'image',
-        blob: entry.posterBlob,
-        mimeType: entry.posterBlob.type || 'image/jpeg',
-        size: entry.posterBlob.size,
-        prompt: entry.prompt || '',
-        params: '',
-        createdAt,
+      posterAssetId = await allocateImportedAsset(posterBlob, {
+        contentType: posterBlob.type || 'image/jpeg',
       });
+      allocatedIds.push(posterAssetId);
+      const posterRef = posterAssetId;
+      await writeImportedMediaCache(() =>
+        db.mediaFiles.put({
+          id: mediaFileKey(stageId, posterRef),
+          stageId,
+          type: 'image',
+          blob: posterBlob,
+          mimeType: posterBlob.type || 'image/jpeg',
+          size: posterBlob.size,
+          prompt: entry.prompt || '',
+          params: '',
+          createdAt,
+        }),
+      );
     }
     posterByMediaRef.set(entry.oldRef, posterAssetId);
     for (const oldPosterRef of oldPosterRefs) {
@@ -392,6 +420,8 @@ export function useImportClassroom(onSuccess?: (importedStageId: string) => void
           return;
         }
 
+        await installClassroomProjects(zip, manifest);
+
         // 3. Generate new IDs
         const newStageId = nanoid();
         importedStageId = newStageId;
@@ -410,7 +440,7 @@ export function useImportClassroom(onSuccess?: (importedStageId: string) => void
               ? nonTeacherAgentIndex
               : undefined;
 
-        // 4. Write media to IndexedDB
+        // 4. Store media before publishing the document's references.
         setPhase('writingMedia');
         toast.loading(t('import.writingMedia'), { id: toastId });
 
@@ -516,7 +546,18 @@ export function useImportClassroom(onSuccess?: (importedStageId: string) => void
         // replaces.
         await mutateDocument(
           newStageId,
-          async (_existing, store) => store.saveDocument(document),
+          async (_existing, store) => {
+            try {
+              await store.saveDocument(document);
+            } catch (saveError) {
+              try {
+                if (await store.loadDocument(newStageId)) return;
+              } catch (verificationError) {
+                log.error('Failed to verify rejected document write:', verificationError);
+              }
+              throw saveError;
+            }
+          },
           {},
           { mode: 'replace' },
         );
@@ -525,12 +566,17 @@ export function useImportClassroom(onSuccess?: (importedStageId: string) => void
       } catch (error) {
         log.error('Classroom ZIP import failed:', error);
         const isQuotaError = error instanceof DOMException && error.name === 'QuotaExceededError';
-        toast.error(isQuotaError ? t('import.error.storageFull') : t('import.error.invalidZip'), {
-          id: toastId,
-        });
+        const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+        const message = isStorageFullFailure(typeof code === 'string' ? code : undefined)
+          ? t('settings.mediaStorageFull')
+          : isQuotaError
+            ? t('import.error.storageFull')
+            : t('import.error.invalidZip');
+        toast.error(message, { id: toastId });
       } finally {
-        // Media files cannot join the aggregate document transaction. Until the
-        // document commit point, compensate every row/allocation individually.
+        // A rejected response does not prove the atomic document write failed.
+        // Never delete by stage id here. Local rows are disposable caches, and
+        // the pending collector reclaims unreferenced server assets.
         const cleanup = async (label: string, operation: () => Promise<unknown>) => {
           try {
             await operation();
@@ -540,11 +586,6 @@ export function useImportClassroom(onSuccess?: (importedStageId: string) => void
         };
         if (!importCommitted && importedStageId) {
           const stageId = importedStageId;
-          await cleanup('document', async () => {
-            await mutateDocument(stageId, async (_document, store) =>
-              store.deleteDocument(stageId),
-            );
-          });
           await cleanup('generated media', () =>
             db.mediaFiles.where('stageId').equals(stageId).delete(),
           );

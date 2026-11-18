@@ -1,16 +1,16 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { db, type VoiceProfileRecord } from '@/lib/utils/database';
+import { db, type VoiceProfileRecord } from '@/lib/device-storage/database';
 import type { TTSVoiceInfo } from '@/lib/audio/types';
 import {
   VOXCPM_AUTO_VOICE,
   VOXCPM_AUTO_VOICE_ID,
   VOXCPM_TTS_PROVIDER_ID,
-  buildAutoVoxCPMVoicePrompt,
   getVoxCPMProfileIdFromVoiceId,
   getVoxCPMProfileVoiceId,
   voxCPMBackendSupportsVoiceRegistration,
+  voxCPMPromptProviderOptions,
   type VoxCPMProviderOptions,
   type VoxCPMVoicePromptContext,
 } from '@/lib/audio/voxcpm';
@@ -20,7 +20,11 @@ import {
   registerVoiceFromReference,
   type VoiceRegistrationRequestConfig,
 } from '@/lib/audio/voice-registration-client';
-import { InvalidReferenceAudioError, validateReferenceAudio } from '@/lib/audio/wav-validate';
+import {
+  InvalidReferenceAudioError,
+  QWEN_MIN_REFERENCE_DURATION_SECONDS,
+  validateReferenceAudio,
+} from '@/lib/audio/wav-validate';
 
 export type VoxCPMVoiceProfile = VoiceProfileRecord;
 
@@ -161,7 +165,10 @@ export async function normalizeQwenReferenceAudio(
 ): Promise<{ blob: Blob; name: string; mimeType: string }> {
   const audioBuffer = await decodeAudioBlob(blob);
   const wav = new Blob([audioBufferToMonoWav(audioBuffer, 24_000)], { type: 'audio/wav' });
-  validateReferenceAudio(new Uint8Array(await wav.arrayBuffer()));
+  validateReferenceAudio(
+    new Uint8Array(await wav.arrayBuffer()),
+    QWEN_MIN_REFERENCE_DURATION_SECONDS,
+  );
   return {
     blob: wav,
     name: replaceFileExtension(fileName, 'wav'),
@@ -362,10 +369,7 @@ export function useQwenVoiceProfiles() {
   }, [refresh]);
 
   const addCloneVoice = useCallback(
-    async (
-      input: { name: string; referenceAudio: File; refText: string },
-      request: VoiceRegistrationRequestConfig,
-    ) => {
+    async (input: { name: string; referenceAudio: File; refText?: string }) => {
       const normalized = await normalizeQwenReferenceAudio(
         input.referenceAudio,
         input.referenceAudio.name,
@@ -373,15 +377,11 @@ export function useQwenVoiceProfiles() {
       const referenceAudio = new File([normalized.blob], normalized.name, {
         type: normalized.mimeType,
       });
-      const voiceId = await registerVoiceFromReference(
-        'qwen-tts',
-        {
-          name: input.name,
-          referenceAudio,
-          refText: input.refText,
-        },
-        request,
-      );
+      const voiceId = await registerVoiceFromReference('qwen-tts', {
+        name: input.name,
+        referenceAudio,
+        refText: input.refText,
+      });
       const now = Date.now();
       await db.voiceProfiles.put({
         id: voiceId,
@@ -403,8 +403,8 @@ export function useQwenVoiceProfiles() {
   );
 
   const deleteVoice = useCallback(
-    async (id: string, request: VoiceRegistrationRequestConfig) => {
-      const vendorDeleted = await deleteRegisteredVoice('qwen-tts', id, request);
+    async (id: string) => {
+      const vendorDeleted = await deleteRegisteredVoice('qwen-tts', id);
       if (!vendorDeleted) {
         console.warn('[QwenVoiceProfiles] Provider deletion failed; removing local profile');
       }
@@ -439,27 +439,17 @@ export async function getVoxCPMProviderOptions(
         ).catch(() => undefined)
       : undefined;
     return {
-      voiceMode: 'auto',
-      voicePrompt: buildAutoVoxCPMVoicePrompt(context), // inline fallback always set
+      // The inline fallback is always set.
+      ...voxCPMPromptProviderOptions(voiceId, context),
       ...(registeredVoiceId ? { registeredVoiceId } : {}),
     };
   }
 
   const profileId = getVoxCPMProfileIdFromVoiceId(voiceId);
-  if (!profileId) {
-    return {
-      voiceMode: 'prompt',
-      voicePrompt: voiceId,
-    };
-  }
+  if (!profileId) return voxCPMPromptProviderOptions(voiceId, context);
 
   const profile = await db.voiceProfiles.get(profileId);
-  if (!profile) {
-    return {
-      voiceMode: 'auto',
-      voicePrompt: buildAutoVoxCPMVoicePrompt(context),
-    };
-  }
+  if (!profile) return voxCPMPromptProviderOptions(voiceId, context);
 
   if (profile.kind === 'clone' && profile.referenceAudio) {
     return {

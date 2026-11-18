@@ -3,18 +3,14 @@ import type { QuizContent, QuizQuestion } from '@/lib/types/stage';
 import {
   addOption,
   addQuestion,
-  commitQuizContent,
   createBlankQuestion,
-  createQuizEditHistory,
   deleteOption,
   deleteQuestion,
   MAX_OPTIONS,
-  redoQuiz,
   reorderOptions,
   reorderQuestions,
   setQuestionType,
   toggleCorrect,
-  undoQuiz,
   updateOptionLabel,
   updateQuestion,
 } from '@/components/edit/surfaces/quiz/quiz-edit-ops';
@@ -38,41 +34,6 @@ function choiceQuestion(over: Partial<QuizQuestion> = {}): QuizQuestion {
 function content(...questions: QuizQuestion[]): QuizContent {
   return { type: 'quiz', questions };
 }
-
-describe('quiz history primitive', () => {
-  it('commit pushes a fresh undo step and clears redo', () => {
-    const a = content(choiceQuestion());
-    const b = content(choiceQuestion({ question: 'changed' }));
-    let h = createQuizEditHistory(a);
-    h = commitQuizContent(h, b);
-    expect(h.present).toBe(b);
-    expect(h.past).toEqual([a]);
-    expect(h.future).toEqual([]);
-  });
-
-  it('committing the same reference is a no-op (no empty undo step)', () => {
-    const a = content(choiceQuestion());
-    const h = createQuizEditHistory(a);
-    expect(commitQuizContent(h, a)).toBe(h);
-  });
-
-  it('undo / redo walk the timeline', () => {
-    const a = content(choiceQuestion({ question: 'a' }));
-    const b = content(choiceQuestion({ question: 'b' }));
-    let h = commitQuizContent(createQuizEditHistory(a), b);
-    h = undoQuiz(h);
-    expect(h.present).toBe(a);
-    expect(h.future).toEqual([b]);
-    h = redoQuiz(h);
-    expect(h.present).toBe(b);
-  });
-
-  it('undo / redo at the ends are no-ops', () => {
-    const h = createQuizEditHistory(content());
-    expect(undoQuiz(h)).toBe(h);
-    expect(redoQuiz(h)).toBe(h);
-  });
-});
 
 describe('question factories + list ops', () => {
   it('createBlankQuestion seeds two options for choice, none for short_answer', () => {
@@ -198,6 +159,44 @@ describe('option mutations keep value=letter and answer correct', () => {
     expect(multi.questions[0].answer).toEqual(['A', 'C']);
     multi = toggleCorrect(multi, 'q1', 0); // remove A
     expect(multi.questions[0].answer).toEqual(['C']);
+  });
+
+  // A key stored as an option LABEL (an AI-generation legacy form) reads as
+  // correct in the review UI and to the grader. The rows must agree, or the
+  // next mutation rebuilds `answer` from all-false rows and drops it.
+  describe('label-stored correct answers survive option mutations', () => {
+    function labelKeyed(over: Partial<QuizQuestion> = {}): QuizQuestion {
+      return choiceQuestion({
+        options: [
+          { label: '(6, 2)', value: 'A' },
+          { label: '(2, -4)', value: 'B' },
+          { label: '(6, -3)', value: 'C' },
+        ],
+        answer: ['(6, 2)'],
+        ...over,
+      });
+    }
+
+    it('an unrelated option-label edit keeps the answer', () => {
+      const q = updateOptionLabel(content(labelKeyed()), 'q1', 2, '(0, 0)').questions[0];
+      expect(q.options?.map((o) => o.label)).toEqual(['(6, 2)', '(2, -4)', '(0, 0)']);
+      expect(q.answer).toEqual(['A']);
+    });
+
+    it('an option reorder carries the correct answer to its new letter', () => {
+      const q = reorderOptions(content(labelKeyed()), 'q1', 0, 2).questions[0];
+      expect(q.options?.map((o) => o.label)).toEqual(['(2, -4)', '(6, -3)', '(6, 2)']);
+      expect(q.answer).toEqual(['C']);
+    });
+
+    it('a multiple-choice toggle preserves the label-stored answer', () => {
+      const q = toggleCorrect(
+        content(labelKeyed({ type: 'multiple', answer: ['(6, 2)'] })),
+        'q1',
+        1,
+      ).questions[0];
+      expect(q.answer).toEqual(['A', 'B']); // A survived the toggle, B was added
+    });
   });
 
   it('option mutations on a short_answer question are no-ops', () => {

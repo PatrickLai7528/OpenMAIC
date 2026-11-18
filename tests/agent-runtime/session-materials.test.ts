@@ -14,6 +14,15 @@ import { ensureAgentSessionSchema, PgAgentSessionStore } from '@openmaic/storage
 import type { Queryable } from '@openmaic/storage/asset/pg';
 import { setMaterialByteStoreForTests } from '@/lib/server/materials/bytes';
 
+// Schema bootstrap is serialized by a PostgreSQL advisory lock on a dedicated
+// connection; the fakes here have no connections, and the lock itself is
+// exercised against a real server in schema-bootstrap-concurrency.pg.test.ts.
+vi.mock('@/lib/persistence/schema-bootstrap-lock', () => ({
+  SCHEMA_BOOTSTRAP_LOCK_KEY: 0,
+  withSchemaBootstrapLock: <T>(pool: unknown, body: (queryable: never) => Promise<T>) =>
+    body(pool as never),
+}));
+
 const mocks = vi.hoisted(() => ({
   getAgentSessionStore: vi.fn(),
   getServerPersistenceProvider: vi.fn(),
@@ -29,9 +38,9 @@ vi.mock('@/lib/persistence/server-provider', () => ({
 
 import {
   createWebMaterial,
+  getAgentSessionMaterialStore,
   getSessionMaterial,
   listSessionMaterials,
-  sessionMaterialsPromptBlock,
 } from '@/lib/server/agent-runtime/session-materials';
 import { buildFetchUrlTool } from '@/lib/server/agent-runtime/fetch-url';
 import { registerSessionUrls } from '@/lib/server/agent-runtime/session-urls';
@@ -51,6 +60,10 @@ async function makeHost() {
       return value;
     },
     delete: async (key) => void bytes.delete(key),
+    deletePrefix: async (prefix: string) => {
+      for (const key of [...bytes.keys()]) if (key.startsWith(prefix)) bytes.delete(key);
+    },
+    list: async () => [],
   });
   const sessionStore = new PgAgentSessionStore(db, {
     withTransaction: (body) => db.transaction((tx: Queryable) => body(tx)),
@@ -176,40 +189,19 @@ describe('session materials persistence', () => {
     expect(await getSessionMaterial('session-other', rows[0]!.id)).toBeNull();
   });
 });
-
-describe('sessionMaterialsPromptBlock', () => {
-  it('lists safe metadata and directs the agent to the registered material tools', () => {
-    const prompt = sessionMaterialsPromptBlock([
-      {
-        id: 'mat_1',
-        sessionId: 'ses_1',
-        kind: 'web',
-        title: 'Sample article',
-        sourceUrl: 'https://example.com/a',
-        textAssetId: 'ast_1',
-        rawAssetId: null,
-        textChars: 42,
-        derivedFrom: null,
-        extraction: { status: 'done', attempts: 0 },
-        createdAt: new Date(0).toISOString(),
-      },
-    ]);
-
-    expect(prompt).toContain('Sample article');
-    expect(prompt).toContain('list_materials');
-    expect(prompt).toContain('read_material');
-    expect(prompt).toContain('nextOffset');
-    expect(prompt).toContain('search_material');
-    expect(prompt).toContain('literal text');
-    expect(prompt).toContain('fetched and extracted');
-    expect(prompt).toContain('extract_material');
-    expect(prompt).toContain('wait_for_materials');
-    expect(prompt).toContain('use_material_media');
-    expect(prompt).not.toContain('textAssetId');
-    expect(prompt).not.toContain('sourceUrl');
-  });
-
-  it('emits no block when the session has no materials', () => {
-    expect(sessionMaterialsPromptBlock([])).toBe('');
+describe('the material store on a fresh database', () => {
+  it('provisions the agent-session schema before its own, whoever asks first', async () => {
+    const db = new PGlite();
+    await db.waitReady;
+    // The extraction runner's first scan can be the first caller: nothing has
+    // created agent_sessions yet, which the material table references.
+    mocks.getAgentSessionStore.mockImplementation(async () => {
+      await ensureAgentSessionSchema(db);
+      return {};
+    });
+    mocks.getServerPersistenceProvider.mockResolvedValue({ pool: db });
+    vi.stubEnv('DATABASE_URL', `postgres://fresh-${++dbCounter}`);
+    await expect(getAgentSessionMaterialStore()).resolves.toBeDefined();
+    expect(mocks.getAgentSessionStore).toHaveBeenCalledTimes(1);
   });
 });

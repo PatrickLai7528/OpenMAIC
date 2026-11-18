@@ -150,10 +150,33 @@ import { experimental_transcribe as transcribe } from 'ai';
 import type { ASRModelConfig } from './types';
 import { isCustomASRProvider } from './types';
 import { ASR_PROVIDERS } from './constants';
+import { asrFetchSignal } from '@/lib/audio/asr-fetch-signal';
+import {
+  DEEPSEEK_TOOLS_DEFAULT_BASE_URL,
+  deepseekToolsEndpoint,
+} from '@/lib/web-search/deepseek-endpoint';
+import {
+  audioEndpointPolicy,
+  audioProviderFetch,
+  createAudioProviderFetch,
+} from '@/lib/server/audio-provider-fetch';
 
 /**
  * Result of ASR transcription
  */
+
+/**
+ * The audio is valid but exceeds a provider's documented per-request limit
+ * (size or duration). Its message is written for the end user, so the
+ * transcription route returns it as is instead of a generic failure.
+ */
+export class ASRInputLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ASRInputLimitError';
+  }
+}
+
 export interface ASRTranscriptionResult {
   text: string;
 }
@@ -196,6 +219,12 @@ export async function transcribeAudio(
         'Lemonade',
       );
 
+    case 'xiaomi-asr':
+      return await transcribeXiaomiASR(config, audioBuffer);
+
+    case 'deepseek-asr':
+      return await transcribeDeepSeekASR(config, audioBuffer);
+
     default:
       if (isCustomASRProvider(config.providerId)) {
         return await transcribeCustomOpenAICompatibleASR(config, audioBuffer);
@@ -235,11 +264,15 @@ async function transcribeWavOpenAICompatibleASR(
     formData.set('language', config.language);
   }
 
-  const response = await fetch(`${baseUrl}/audio/transcriptions`, {
-    method: 'POST',
-    headers: getOptionalBearerAuthHeaders(config.apiKey),
-    body: formData,
-  });
+  const response = await audioProviderFetch(
+    `${baseUrl}/audio/transcriptions`,
+    {
+      method: 'POST',
+      headers: getOptionalBearerAuthHeaders(config.apiKey),
+      body: formData,
+    },
+    audioEndpointPolicy(config),
+  );
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => response.statusText);
@@ -331,9 +364,11 @@ async function transcribeCustomOpenAICompatibleASR(
       audioBuffer.byteOffset,
       audioBuffer.byteOffset + audioBuffer.byteLength,
     ) as ArrayBuffer;
-    // Preserve existing type when converting from Buffer; fall back to webm
-    // (the default recording format used by the browser MediaRecorder API).
-    audioBlob = new Blob([arrayBuffer], { type: 'audio/webm' });
+    // Local media extraction supplies WAV chunks as Buffers. Match the MIME
+    // type to their RIFF/WAVE header; keep WebM as the recording fallback.
+    audioBlob = new Blob([arrayBuffer], {
+      type: detectWavBuffer(audioBuffer) ? 'audio/wav' : 'audio/webm',
+    });
   }
 
   // Most OpenAI-compatible transcription endpoints treat `model` as a
@@ -349,18 +384,22 @@ async function transcribeCustomOpenAICompatibleASR(
 
   const formData = new FormData();
   // Use 'file' key — required by the OpenAI audio/transcriptions spec.
-  formData.set('file', audioBlob, 'audio.webm');
+  formData.set('file', audioBlob, (await isWavAudio(audioBlob)) ? 'audio.wav' : 'audio.webm');
   formData.set('model', config.modelId);
   formData.set('response_format', 'json');
   if (config.language && config.language !== 'auto') {
     formData.set('language', config.language);
   }
 
-  const response = await fetch(`${baseUrl}/audio/transcriptions`, {
-    method: 'POST',
-    headers: getOptionalBearerAuthHeaders(config.apiKey),
-    body: formData,
-  });
+  const response = await audioProviderFetch(
+    `${baseUrl}/audio/transcriptions`,
+    {
+      method: 'POST',
+      headers: getOptionalBearerAuthHeaders(config.apiKey),
+      body: formData,
+    },
+    audioEndpointPolicy(config),
+  );
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => response.statusText);
@@ -386,9 +425,27 @@ async function transcribeOpenAIWhisper(
   config: ASRModelConfig,
   audioBuffer: Buffer | Blob,
 ): Promise<ASRTranscriptionResult> {
+  const modelId = config.modelId || ASR_PROVIDERS['openai-whisper'].defaultModelId;
+  const baseUrl = config.baseUrl || ASR_PROVIDERS['openai-whisper'].defaultBaseUrl;
+  const isOfficialEndpoint =
+    baseUrl?.replace(/\/+$/, '') === ASR_PROVIDERS['openai-whisper'].defaultBaseUrl;
+  // Compatible endpoints may reject verbose_json even for whisper-1. Keep
+  // SDK behavior only for known models on the official OpenAI endpoint;
+  // otherwise reuse the JSON adapter and its guarded transport.
+  if (
+    !isOfficialEndpoint ||
+    !['whisper-1', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe'].includes(modelId)
+  ) {
+    return transcribeCustomOpenAICompatibleASR({ ...config, modelId, baseUrl }, audioBuffer);
+  }
+
   const openai = createOpenAI({
     apiKey: config.apiKey!,
-    baseURL: config.baseUrl || ASR_PROVIDERS['openai-whisper'].defaultBaseUrl,
+    baseURL: baseUrl,
+    // The AI SDK issues the multipart upload through this transport, so the
+    // provider request inherits the same redirect + pinned-DNS protection as
+    // the raw provider fetches.
+    fetch: createAudioProviderFetch(audioEndpointPolicy(config)) as typeof fetch,
   });
 
   // Convert to Buffer or Uint8Array (which is required by the AI SDK)
@@ -404,7 +461,7 @@ async function transcribeOpenAIWhisper(
 
   try {
     const result = await transcribe({
-      model: openai.transcription(config.modelId || ASR_PROVIDERS['openai-whisper'].defaultModelId),
+      model: openai.transcription(modelId),
       audio: audioData,
       providerOptions: {
         openai: {
@@ -471,15 +528,19 @@ async function transcribeQwenASR(
     };
   }
 
-  const response = await fetch(`${baseUrl}/services/aigc/multimodal-generation/generation`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${config.apiKey}`,
-      'Content-Type': 'application/json; charset=utf-8',
-      'X-DashScope-Audio-Format': 'wav',
+  const response = await audioProviderFetch(
+    `${baseUrl}/services/aigc/multimodal-generation/generation`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json; charset=utf-8',
+        'X-DashScope-Audio-Format': 'wav',
+      },
+      body: JSON.stringify(requestBody),
     },
-    body: JSON.stringify(requestBody),
-  });
+    audioEndpointPolicy(config),
+  );
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => response.statusText);
@@ -517,6 +578,39 @@ async function transcribeQwenASR(
 }
 
 /**
+ * The URL an Azure base URL is sent to: the regional API host, the
+ * transcribe path, and the default `api-version` when none is set.
+ */
+function azureTranscriptionUrl(rawBaseUrl: string): URL {
+  let endpoint = rawBaseUrl.replace(/\/+$/, '');
+  if (/\.stt\.speech\.microsoft\.com$/i.test(endpoint)) {
+    endpoint = endpoint.replace(/\.stt\.speech\.microsoft\.com$/i, '.api.cognitive.microsoft.com');
+  }
+  if (!/\/speechtotext\/transcriptions:transcribe/i.test(endpoint)) {
+    endpoint = `${endpoint}/speechtotext/transcriptions:transcribe`;
+  }
+  const url = new URL(endpoint);
+  if (!url.searchParams.get('api-version')) {
+    url.searchParams.set('api-version', '2025-10-15');
+  }
+  return url;
+}
+
+/**
+ * The URL a provider's requests are sent to, where that differs from its
+ * configured base URL (today only Azure's). A base URL a request could not
+ * be sent to is returned unchanged.
+ */
+export function asrRequestUrl(providerId: string, baseUrl: string | undefined): string | undefined {
+  if (providerId !== 'azure-asr' || !baseUrl || baseUrl.includes('{region}')) return baseUrl;
+  try {
+    return azureTranscriptionUrl(baseUrl).toString();
+  } catch {
+    return baseUrl;
+  }
+}
+
+/**
  * Azure STT implementation (Fast Transcription REST API)
  * https://learn.microsoft.com/azure/ai-services/speech-service/fast-transcription-create
  */
@@ -530,17 +624,7 @@ async function transcribeAzureASR(
     throw new Error('Azure STT base URL must include a real region');
   }
 
-  let endpoint = rawBaseUrl.replace(/\/+$/, '');
-  if (/\.stt\.speech\.microsoft\.com$/i.test(endpoint)) {
-    endpoint = endpoint.replace(/\.stt\.speech\.microsoft\.com$/i, '.api.cognitive.microsoft.com');
-  }
-  if (!/\/speechtotext\/transcriptions:transcribe/i.test(endpoint)) {
-    endpoint = `${endpoint}/speechtotext/transcriptions:transcribe`;
-  }
-  const url = new URL(endpoint);
-  if (!url.searchParams.get('api-version')) {
-    url.searchParams.set('api-version', '2025-10-15');
-  }
+  const url = azureTranscriptionUrl(rawBaseUrl);
 
   let audioBlob: Blob;
   if (audioBuffer instanceof Blob) {
@@ -572,11 +656,15 @@ async function transcribeAzureASR(
     formData.append('definition', JSON.stringify({ locales: [locale] }));
   }
 
-  const response = await fetch(url.toString(), {
-    method: 'POST',
-    headers: { 'Ocp-Apim-Subscription-Key': config.apiKey! },
-    body: formData,
-  });
+  const response = await audioProviderFetch(
+    url.toString(),
+    {
+      method: 'POST',
+      headers: { 'Ocp-Apim-Subscription-Key': config.apiKey! },
+      body: formData,
+    },
+    audioEndpointPolicy(config),
+  );
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => response.statusText);
@@ -601,30 +689,303 @@ async function transcribeAzureASR(
 }
 
 /**
- * Get current ASR configuration from settings store
- * Note: This function should only be called in browser context
+ * Xiaomi MiMo ASR transcription.
+ *
+ * MiMo ASR reuses the chat/completions protocol rather than OpenAI's
+ * /audio/transcriptions: the audio sample rides inside a user message as an
+ * `input_audio` data-URL part (the documented wav/mp3 only, base64,
+ * <= 10 MB encoded), the language hint goes in `asr_options`, and the
+ * transcript comes back as the assistant message's plain text content.
  */
-export async function getCurrentASRConfig(): Promise<ASRModelConfig> {
-  if (typeof window === 'undefined') {
-    throw new Error('getCurrentASRConfig() can only be called in browser context');
+/** MiMo documents a 10 MB cap on the base64-encoded input_audio payload. */
+const MAX_XIAOMI_ASR_ENCODED_BYTES = 10 * 1024 * 1024;
+
+async function transcribeXiaomiASR(
+  config: ASRModelConfig,
+  audioBuffer: Buffer | Blob,
+): Promise<ASRTranscriptionResult> {
+  const baseUrl = (config.baseUrl || ASR_PROVIDERS['xiaomi-asr'].defaultBaseUrl || '').replace(
+    /\/+$/,
+    '',
+  );
+
+  const audioBlob = await toAudioBlob(audioBuffer);
+  const bytes = new Uint8Array(await audioBlob.arrayBuffer());
+  // The bytes decide, never the client-declared Content-Type: a WebM or
+  // corrupt upload claiming to be WAV must be refused here, not forwarded.
+  const mimeType = resolveXiaomiASRAudioMime(bytes);
+  if (!mimeType) {
+    throw new Error(
+      'Xiaomi MiMo ASR supports wav/mp3 audio only (browser recordings are transcoded to WAV client-side before upload).',
+    );
+  }
+  const base64 = Buffer.from(bytes).toString('base64');
+  // MiMo documents a 10 MB cap on the base64-encoded input_audio payload.
+  // Browser recordings expand into uncompressed WAV, so long dictations hit
+  // this here with a clear message instead of an opaque provider error.
+  if (base64.length > MAX_XIAOMI_ASR_ENCODED_BYTES) {
+    // 48 kHz mono WAV is ~96 KB/s raw (~125 KB/s once base64-encoded), so
+    // roughly 80 seconds of speech already reaches the documented 10 MB
+    // input_audio ceiling.
+    throw new Error(
+      `Xiaomi MiMo ASR audio exceeds the documented 10 MB input_audio limit ` +
+        `(${Math.round(base64.length / 1024 / 1024)} MB encoded). Shorten the audio.`,
+    );
   }
 
-  // Lazy import to avoid circular dependency
-  const { useSettingsStore } = await import('@/lib/store/settings');
-  const { asrProviderId, asrLanguage, asrProvidersConfig } = useSettingsStore.getState();
+  const response = await audioProviderFetch(
+    `${baseUrl}/chat/completions`,
+    {
+      method: 'POST',
+      headers: {
+        ...getOptionalBearerAuthHeaders(config.apiKey),
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({
+        model: config.modelId || ASR_PROVIDERS['xiaomi-asr'].defaultModelId,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'input_audio',
+                input_audio: { data: `data:${mimeType};base64,${base64}` },
+              },
+            ],
+          },
+        ],
+        ...(config.language && config.language !== 'auto'
+          ? { asr_options: { language: config.language } }
+          : {}),
+      }),
+      // Extraction wraps the call in an abort scope (timeout/cancel); the
+      // pinned transport bypasses the globalThis.fetch patch, so the context
+      // signal is passed explicitly here.
+      ...(asrFetchSignal.getStore() ? { signal: asrFetchSignal.getStore() } : {}),
+    },
+    audioEndpointPolicy(config),
+  );
 
-  const providerConfig = asrProvidersConfig?.[asrProviderId];
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => response.statusText);
+    throw new Error(`Xiaomi MiMo ASR API error: ${errorText || response.statusText}`);
+  }
 
-  return {
-    providerId: asrProviderId,
-    modelId:
-      providerConfig?.modelId ||
-      ASR_PROVIDERS[asrProviderId as keyof typeof ASR_PROVIDERS]?.defaultModelId ||
-      '',
-    apiKey: providerConfig?.apiKey,
-    baseUrl: providerConfig?.baseUrl || providerConfig?.customDefaultBaseUrl,
-    language: asrLanguage,
+  const data = await response.json();
+  const text = data?.choices?.[0]?.message?.content;
+  return { text: typeof text === 'string' ? text : '' };
+}
+
+/**
+ * The mime types MiMo ASR accepts — the documented wav and mp3 only — detected
+ * from the bytes rather than trusted from the recording's declared type.
+ * Anything else (flac, mp4, ogg, ...) is rejected locally here.
+ */
+function resolveXiaomiASRAudioMime(bytes: Uint8Array): string | null {
+  // RIFF....WAVE
+  if (
+    bytes.length > 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x41 &&
+    bytes[10] === 0x56 &&
+    bytes[11] === 0x45
+  ) {
+    return 'audio/wav';
+  }
+  // The layer bits must be nonzero: ADTS AAC shares the MPEG sync word
+  // (FF F1 / FF F9 ...) but always carries layer 00, so without this check
+  // an unsupported AAC upload is mislabeled as MP3 and sent to the provider.
+  if (bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0 && (bytes[1] & 0x06) !== 0) {
+    return 'audio/mp3';
+  }
+  if (bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) return 'audio/mp3';
+  return null;
+}
+
+/** DeepSeek ASR takes at most 8 MiB of audio per request. */
+const MAX_DEEPSEEK_ASR_BYTES = 8 * 1024 * 1024;
+/** DeepSeek ASR takes at most 120 seconds of audio per request. */
+export const MAX_DEEPSEEK_ASR_SECONDS = 120;
+
+/**
+ * DeepSeek ASR (POST /v1/tools/asr).
+ *
+ * The whole file goes up in one multipart `file` field and the complete
+ * transcript comes back as `{ request_id, text, duration_ms }`. The service
+ * accepts 16-bit PCM WAV or Ogg Opus only (browser recordings are transcoded
+ * to WAV client-side, server media chunks are already WAV), at most 8 MiB and
+ * 120 seconds; there is no model or language parameter (the language is
+ * detected from the audio) and no streaming. Audio over the limits is refused
+ * here with a clear message instead of an opaque provider error; server-side
+ * media extraction keeps its chunks under the cap (`maxChunkSeconds`).
+ */
+async function transcribeDeepSeekASR(
+  config: ASRModelConfig,
+  audioBuffer: Buffer | Blob,
+): Promise<ASRTranscriptionResult> {
+  const endpoint = deepseekToolsEndpoint(
+    config.baseUrl ||
+      ASR_PROVIDERS['deepseek-asr'].defaultBaseUrl ||
+      DEEPSEEK_TOOLS_DEFAULT_BASE_URL,
+    'asr',
+  );
+
+  const audioBlob = await toAudioBlob(audioBuffer);
+  const bytes = new Uint8Array(await audioBlob.arrayBuffer());
+  // The bytes decide, never the declared Content-Type.
+  const format = deepseekASRFormat(bytes);
+  if (!format) {
+    throw new Error(
+      'DeepSeek ASR accepts 16-bit PCM WAV or Ogg Opus audio only (browser recordings are converted to WAV before upload).',
+    );
+  }
+  if (bytes.byteLength > MAX_DEEPSEEK_ASR_BYTES) {
+    throw new ASRInputLimitError(
+      `DeepSeek ASR accepts at most 8 MiB of audio per request ` +
+        `(${(bytes.byteLength / 1024 / 1024).toFixed(1)} MiB). Record a shorter clip.`,
+    );
+  }
+  let seconds: number | null;
+  if (format === 'wav') {
+    seconds = wavDurationSeconds(bytes);
+    if (seconds === null) {
+      throw new Error('DeepSeek ASR accepts 16-bit PCM WAV only; this WAV is not 16-bit PCM.');
+    }
+  } else {
+    // Unreadable Ogg timing is left to the service to judge.
+    seconds = oggOpusDurationSeconds(bytes);
+  }
+  if (seconds !== null && seconds > MAX_DEEPSEEK_ASR_SECONDS) {
+    throw new ASRInputLimitError(
+      `DeepSeek ASR accepts at most ${MAX_DEEPSEEK_ASR_SECONDS} seconds of audio per request ` +
+        `(${Math.ceil(seconds)} s). Record a shorter clip.`,
+    );
+  }
+
+  const formData = new FormData();
+  formData.set(
+    'file',
+    new Blob([bytes], { type: format === 'wav' ? 'audio/wav' : 'audio/ogg' }),
+    format === 'wav' ? 'audio.wav' : 'audio.ogg',
+  );
+
+  const response = await audioProviderFetch(
+    endpoint,
+    {
+      method: 'POST',
+      headers: getOptionalBearerAuthHeaders(config.apiKey),
+      body: formData,
+      // Extraction wraps the call in an abort scope (timeout/cancel); the
+      // pinned transport bypasses the globalThis.fetch patch, so the context
+      // signal is passed explicitly here.
+      ...(asrFetchSignal.getStore() ? { signal: asrFetchSignal.getStore() } : {}),
+    },
+    audioEndpointPolicy(config),
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => response.statusText);
+    let message = errorText || response.statusText;
+    try {
+      const parsed = JSON.parse(errorText) as { error?: { message?: string } | string };
+      const error = parsed.error;
+      message = (typeof error === 'string' ? error : error?.message) || message;
+    } catch {
+      // Keep the raw text for non-JSON errors.
+    }
+    throw new Error(`DeepSeek ASR API error (${response.status}): ${message}`);
+  }
+
+  const data = (await response.json()) as { text?: unknown; error?: { message?: string } };
+  if (data?.error) {
+    throw new Error(`DeepSeek ASR API error: ${data.error.message || 'request failed'}`);
+  }
+  return { text: typeof data?.text === 'string' ? data.text : '' };
+}
+
+/** The container DeepSeek ASR accepts that the bytes are, if any. */
+function deepseekASRFormat(bytes: Uint8Array): 'wav' | 'ogg' | null {
+  if (detectWavBytes(bytes)) return 'wav';
+  // "OggS" capture pattern.
+  if (
+    bytes.byteLength >= 4 &&
+    bytes[0] === 0x4f &&
+    bytes[1] === 0x67 &&
+    bytes[2] === 0x67 &&
+    bytes[3] === 0x53
+  ) {
+    return 'ogg';
+  }
+  return null;
+}
+
+/**
+ * Seconds of audio in an Ogg Opus stream: the granule position of the last
+ * page counts 48 kHz samples, less the pre-skip declared in the OpusHead
+ * packet. Null when there is no OpusHead or no positive granule position.
+ */
+function oggOpusDurationSeconds(bytes: Uint8Array): number | null {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const isAt = (offset: number, tag: string) => {
+    for (let i = 0; i < tag.length; i += 1) {
+      if (bytes[offset + i] !== tag.charCodeAt(i)) return false;
+    }
+    return true;
   };
+  let preSkip = -1;
+  const headLimit = Math.min(bytes.byteLength - 12, 512);
+  for (let offset = 0; offset <= headLimit; offset += 1) {
+    if (isAt(offset, 'OpusHead')) {
+      preSkip = view.getUint16(offset + 10, true);
+      break;
+    }
+  }
+  if (preSkip < 0) return null;
+  // The last page header: "OggS", version 0, then the 64-bit granule position.
+  for (let offset = bytes.byteLength - 27; offset >= 0; offset -= 1) {
+    if (isAt(offset, 'OggS') && bytes[offset + 4] === 0) {
+      const granule = Number(view.getBigInt64(offset + 6, true));
+      if (granule <= 0) return null;
+      return Math.max(0, granule - preSkip) / 48000;
+    }
+  }
+  return null;
+}
+
+/**
+ * Seconds of audio in a 16-bit PCM WAV, from its fmt chunk's byte rate and the
+ * data that follows the data chunk header (a streamed WAV may declare the
+ * placeholder size 0xFFFFFFFF, so the bytes present bound it). Null when the
+ * file is not 16-bit PCM or has no readable fmt/data chunks.
+ */
+function wavDurationSeconds(bytes: Uint8Array): number | null {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const ascii = (start: number) => String.fromCharCode(...bytes.subarray(start, start + 4));
+  let offset = 12;
+  let byteRate = 0;
+  while (offset + 8 <= bytes.byteLength) {
+    const id = ascii(offset);
+    const size = view.getUint32(offset + 4, true);
+    const start = offset + 8;
+    if (id === 'fmt ') {
+      if (size < 16 || start + 16 > bytes.byteLength) return null;
+      const format = view.getUint16(start, true);
+      const bitsPerSample = view.getUint16(start + 14, true);
+      // 1 = PCM; 0xFFFE = WAVE_FORMAT_EXTENSIBLE, which still carries PCM samples.
+      if ((format !== 1 && format !== 0xfffe) || bitsPerSample !== 16) return null;
+      byteRate = view.getUint32(start + 8, true);
+    } else if (id === 'data') {
+      if (!byteRate) return null;
+      return Math.min(size, bytes.byteLength - start) / byteRate;
+    }
+    if (size === 0xffffffff) return null;
+    offset = start + size + (size % 2);
+  }
+  return null;
 }
 
 // Re-export from constants for convenience

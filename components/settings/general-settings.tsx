@@ -4,6 +4,7 @@ import { useState, useCallback } from 'react';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
 import { UsageDashboard } from './usage-dashboard';
 import {
   AlertDialog,
@@ -16,13 +17,15 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Loader2, Trash2, AlertTriangle } from 'lucide-react';
 import { useI18n } from '@/lib/hooks/use-i18n';
-import { clearDatabase } from '@/lib/utils/database';
+import {
+  clearLocalCache,
+  clearLocalStorageKeepingImportState,
+} from '@/lib/device-storage/clear-local-cache';
 import { useSettingsStore } from '@/lib/store/settings';
 import { useUserProfileStore } from '@/lib/store/user-profile';
 import { toast } from 'sonner';
 import { createLogger } from '@/lib/logger';
-import { clearCacheErrorMessage } from './clear-cache-error-message';
-import { runClearCache, shouldReloadAfterClear } from './clear-cache-workflow';
+import { runClearCache } from './clear-cache-workflow';
 
 const log = createLogger('GeneralSettings');
 
@@ -50,6 +53,8 @@ async function clearPersistedStore(persistApi: PersistApi, fallbackName: string)
 
 export function GeneralSettings() {
   const { t } = useI18n();
+  const autoConfirm = useSettingsStore((s) => s.autoConfirmRecommendedAnswer);
+  const setAutoConfirm = useSettingsStore((s) => s.setAutoConfirmRecommendedAnswer);
 
   // Clear cache state
   const [showClearDialog, setShowClearDialog] = useState(false);
@@ -63,9 +68,9 @@ export function GeneralSettings() {
     if (!isConfirmValid) return;
     setClearing(true);
     try {
-      const result = await runClearCache({
-        clearDatabase,
-        clearLocalStorage: () => localStorage.clear(),
+      await runClearCache({
+        clearLocalCache,
+        clearLocalStorage: () => clearLocalStorageKeepingImportState(),
         clearSessionStorage: () => sessionStorage.clear(),
         clearPersistedStores: async () => {
           // The blanket clear only reaches these stores while their KV backend
@@ -76,19 +81,7 @@ export function GeneralSettings() {
           ]);
         },
       });
-
-      if (result.status === 'asset-pool-deferred') {
-        log.warn('Asset pool deletion deferred; remaining cache cleanup completed.');
-        toast.error(clearCacheErrorMessage(result.error, t));
-      } else {
-        toast.success(t('settings.clearCacheSuccess'));
-      }
-
-      if (!shouldReloadAfterClear(result)) {
-        // The retry stays actionable on this page; see shouldReloadAfterClear.
-        setClearing(false);
-        return;
-      }
+      toast.success(t('settings.clearCacheSuccess'));
 
       // Reload without waiting. The stores are still live in memory, so the
       // longer this page stays up the more chances a `set()` has to persist
@@ -99,7 +92,7 @@ export function GeneralSettings() {
       window.location.reload();
     } catch (error) {
       log.error('Failed to clear cache:', error);
-      toast.error(clearCacheErrorMessage(error, t));
+      toast.error(t('settings.clearCacheFailed'));
       setClearing(false);
     }
   }, [isConfirmValid, t]);
@@ -113,6 +106,24 @@ export function GeneralSettings() {
     <div className="flex flex-col gap-8">
       {/* Usage statistics dashboard */}
       <UsageDashboard />
+
+      {/* The workbench agent's questions: auto-confirm a recommended option. */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0 flex-1">
+          <Label htmlFor="settings-auto-confirm" className="text-sm font-medium">
+            {t('settings.autoConfirmRecommended')}
+          </Label>
+          <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+            {t('settings.autoConfirmRecommendedDesc')}
+          </p>
+        </div>
+        <Switch
+          id="settings-auto-confirm"
+          data-testid="settings-auto-confirm"
+          checked={autoConfirm}
+          onCheckedChange={setAutoConfirm}
+        />
+      </div>
 
       {/* Danger Zone - Clear Cache */}
       <div className="relative rounded-xl border border-destructive/30 bg-destructive/[0.03] dark:bg-destructive/[0.06] overflow-hidden">

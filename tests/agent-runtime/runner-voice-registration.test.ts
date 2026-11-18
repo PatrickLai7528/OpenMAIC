@@ -33,7 +33,7 @@ const mocks = vi.hoisted(() => ({
   createCallLlmStreamFn: vi.fn(),
   buildAgent: vi.fn(),
   resolveWebSearchCapability: vi.fn(),
-  listSessionMaterials: vi.fn(async (): Promise<AgentSessionMaterial[]> => []),
+  listSessionMaterials: vi.fn(async (_sessionId: string): Promise<AgentSessionMaterial[]> => []),
   enabledServerTTSProviderIds: vi.fn(),
   resolveTTSApiKey: vi.fn(),
   getVoiceRegistrationAdapter: vi.fn(),
@@ -56,6 +56,20 @@ vi.mock('@/lib/server/agent-runtime/session-materials', async (importActual) => 
   const actual =
     await importActual<typeof import('@/lib/server/agent-runtime/session-materials')>();
   return { ...actual, listSessionMaterials: mocks.listSessionMaterials };
+});
+// The runner lists what the session reaches through the shared resolver;
+// links need a database these tests do not have.
+vi.mock('@/lib/server/agent-runtime/material-resolver', async (importActual) => {
+  const actual =
+    await importActual<typeof import('@/lib/server/agent-runtime/material-resolver')>();
+  return {
+    ...actual,
+    listSessionScopeMaterials: async (sessionId: string) =>
+      (await mocks.listSessionMaterials(sessionId)).map((record) => ({
+        origin: 'session' as const,
+        record,
+      })),
+  };
 });
 
 vi.mock('@/lib/server/agent-runtime/entry-tree-storage', async (importActual) => {
@@ -99,6 +113,24 @@ vi.mock('@/lib/server/provider-config', async (importActual) => {
     resolveTTSApiKey: mocks.resolveTTSApiKey,
   };
 });
+
+// The run's tts and video slots, as the mocked server listing describes them.
+vi.mock('@/lib/server/model-config/media', async (importActual) => ({
+  ...(await importActual<typeof import('@/lib/server/model-config/media')>()),
+  serverMediaConnection: async (slot: string) => {
+    if (slot !== 'tts') return null;
+    const [providerId] = (mocks.enabledServerTTSProviderIds() as string[] | undefined) ?? [];
+    if (!providerId) return null;
+    const apiKey = mocks.resolveTTSApiKey(providerId) as string | undefined;
+    return {
+      providerId,
+      ...(apiKey ? { apiKey } : {}),
+      managed: true,
+      userEndpoint: false,
+      origin: 'configuration',
+    };
+  },
+}));
 
 vi.mock('@/lib/audio/voice-registration', async (importActual) => {
   const actual = await importActual<typeof import('@/lib/audio/voice-registration')>();
@@ -174,7 +206,7 @@ function makeStore(meta: ClaimedAgentSession) {
     clearCancel: vi.fn(async () => undefined),
     finishSession: vi.fn(async () => true),
     getSession: vi.fn(async () => ({ ...meta, lease: { workerId: WORKER_ID } })),
-    hasSessionRunHistory: vi.fn(async () => false),
+    readEventsAfter: vi.fn(async () => []),
     heartbeat: vi.fn(async () => true),
     getCancelRequestedAt: vi.fn(async () => null),
     isCancelRequested: vi.fn(async () => false),
@@ -293,7 +325,6 @@ describe('voice tool runner registration', () => {
       'generate_actions',
       'duplicate_scene',
       'import_pptx',
-      'generate_image',
       'generate_tts',
       'edit_deck',
       'use_material_media',
@@ -311,6 +342,11 @@ describe('voice tool runner registration', () => {
       'search_material',
       'extract_material',
       'wait_for_materials',
+      'list_material_folders',
+      'create_material_folder',
+      'rename_material_folder',
+      'move_materials',
+      'rename_material',
       'list_voices',
       'set_roster',
       'clip_audio',
@@ -325,6 +361,7 @@ describe('voice tool runner registration', () => {
         'ask_user',
         'clip_audio',
         'create_folder',
+        'create_material_folder',
         'create_skill',
         'create_stage',
         'duplicate_scene',
@@ -332,15 +369,16 @@ describe('voice tool runner registration', () => {
         'extract_material',
         'fetch_url',
         'generate_actions',
-        'generate_image',
         'generate_scene',
         'generate_tts',
         'grep_stage',
         'import_pptx',
         'list_folder_stages',
+        'list_material_folders',
         'list_materials',
         'list_scenes',
         'list_voices',
+        'move_materials',
         'move_to_folder',
         'patch_skill',
         'patch_stage',
@@ -351,6 +389,8 @@ describe('voice tool runner registration', () => {
         'read_stage',
         'read_stage_outline',
         'register_voice',
+        'rename_material',
+        'rename_material_folder',
         'rename_stage',
         'search_chats',
         'search_classrooms',
@@ -382,8 +422,6 @@ describe('voice tool runner registration', () => {
       'generate_actions',
       'duplicate_scene',
       'import_pptx',
-      'generate_image',
-      'generate_tts',
       'edit_deck',
       'use_material_media',
       'read_stage',
@@ -400,6 +438,11 @@ describe('voice tool runner registration', () => {
       'search_material',
       'extract_material',
       'wait_for_materials',
+      'list_material_folders',
+      'create_material_folder',
+      'rename_material_folder',
+      'move_materials',
+      'rename_material',
       'list_voices',
       'set_roster',
       'clip_audio',
@@ -413,6 +456,7 @@ describe('voice tool runner registration', () => {
         'ask_user',
         'clip_audio',
         'create_folder',
+        'create_material_folder',
         'create_skill',
         'create_stage',
         'duplicate_scene',
@@ -420,15 +464,15 @@ describe('voice tool runner registration', () => {
         'extract_material',
         'fetch_url',
         'generate_actions',
-        'generate_image',
         'generate_scene',
-        'generate_tts',
         'grep_stage',
         'import_pptx',
         'list_folder_stages',
+        'list_material_folders',
         'list_materials',
         'list_scenes',
         'list_voices',
+        'move_materials',
         'move_to_folder',
         'patch_skill',
         'patch_stage',
@@ -438,6 +482,8 @@ describe('voice tool runner registration', () => {
         'read_skill',
         'read_stage',
         'read_stage_outline',
+        'rename_material',
+        'rename_material_folder',
         'rename_stage',
         'search_chats',
         'search_classrooms',
@@ -447,10 +493,8 @@ describe('voice tool runner registration', () => {
         'wait_for_materials',
       ].sort(),
     );
-    // The model is told registration is unavailable instead of being handed a
-    // tool that can only throw.
     expect(options.systemPrompt).not.toContain('register_voice the returned clipId');
-    expect(options.systemPrompt).toContain('no voice registration backend');
+    expect(options.systemPrompt).not.toContain('no voice registration backend');
     // Roster guidance is always present (the roster tools are always registered).
     expect(options.systemPrompt).toContain('list_voices');
     expect(options.systemPrompt).toContain('set_roster');

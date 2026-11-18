@@ -21,51 +21,8 @@
  */
 
 import type { QuizContent, QuizQuestion, QuizQuestionType } from '@/lib/types/stage';
+import { answerIncludesOption } from '@/lib/quiz/grading';
 import { createElementId } from '@/lib/edit/element-id';
-
-// ---------------------------------------------------------------------------
-// History primitive (snapshot-based, mirrors slide-ops shape)
-// ---------------------------------------------------------------------------
-
-export interface QuizEditHistory {
-  past: QuizContent[];
-  present: QuizContent;
-  future: QuizContent[];
-}
-
-export function createQuizEditHistory(present: QuizContent): QuizEditHistory {
-  return { past: [], present, future: [] };
-}
-
-/**
- * Fold a new content snapshot in as a fresh undo step. A no-op (identical
- * reference) is dropped so callers can commit unconditionally without
- * polluting the undo stack. Committing clears the redo branch.
- */
-export function commitQuizContent(history: QuizEditHistory, next: QuizContent): QuizEditHistory {
-  if (next === history.present) return history;
-  return { past: [...history.past, history.present], present: next, future: [] };
-}
-
-export function undoQuiz(history: QuizEditHistory): QuizEditHistory {
-  if (history.past.length === 0) return history;
-  const previous = history.past[history.past.length - 1];
-  return {
-    past: history.past.slice(0, -1),
-    present: previous,
-    future: [history.present, ...history.future],
-  };
-}
-
-export function redoQuiz(history: QuizEditHistory): QuizEditHistory {
-  if (history.future.length === 0) return history;
-  const next = history.future[0];
-  return {
-    past: [...history.past, history.present],
-    present: next,
-    future: history.future.slice(1),
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Option-row intermediate
@@ -86,8 +43,14 @@ export function optionLetter(index: number): string {
 }
 
 export function toRows(q: QuizQuestion): OptionRow[] {
-  const answer = q.answer ?? [];
-  return (q.options ?? []).map((o) => ({ label: o.label, correct: answer.includes(o.value) }));
+  return (q.options ?? []).map((o) => ({
+    label: o.label,
+    // The same resolved projection the review UI and the grader use: a key
+    // stored as an option label must read as correct here too. Raw value
+    // equality would report every row as incorrect, and the next mutation
+    // would rebuild `answer` from those rows and silently drop the key.
+    correct: answerIncludesOption(q, o.value),
+  }));
 }
 
 /** Re-derive `options` (value = positional letter) + `answer` from rows. */
