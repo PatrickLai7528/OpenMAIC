@@ -31,9 +31,9 @@ spec:
           # Placeholder; overridden at apply time by apply.sh (IMAGE=...).
           image: openmaic:agent-runtime
           imagePullPolicy: IfNotPresent
-          # anonymous_id cookie Secure 屬性由 ANONYMOUS_COOKIE_SECURE=0
-          # （見 configmap）在應用層關閉；不再需要開機改寫 .next/server 的補丁。
-          # ⚠️ 依賴含 owner.ts cookie 修正的映像（此 YAML 隨該修正一同提交後的 build）。
+          # 上游 identity 層（lib/server/identity/*）已內建 cookie 處理；
+          # 純 HTTP 由 configmap 的 COOKIE_SECURE=0 關閉 Secure，
+          # 不再需要開機改寫 .next/server 的 cookie 補丁。
           ports:
             - name: http
               containerPort: 3000

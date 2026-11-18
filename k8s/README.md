@@ -76,8 +76,6 @@ kubectl -n "$NAMESPACE" create secret generic openmaic-secrets \
   --from-literal=MINIMAX_API_KEY="${MINIMAX_API_KEY:-}" \
   --from-literal=MINIMAX_BASE_URL="${MINIMAX_BASE_URL:-https://api.minimaxi.com/anthropic/v1}" \
   --from-literal=MINIMAX_MODELS="${MINIMAX_MODELS:-MiniMax-M2.7-highspeed}" \
-  --from-literal=PERSISTENCE_DEV_TOKEN="${PERSISTENCE_DEV_TOKEN:-openmaic-school-dev}" \
-  --from-literal=PERSISTENCE_ALLOW_INSECURE_DEV_AUTH=true \
   --from-literal=ACCESS_CODE="${ACCESS_CODE:-}" \
   --dry-run=client -o yaml | kubectl apply -f -
 
@@ -100,8 +98,6 @@ kubectl -n open-maic create secret generic openmaic-secrets \
   --from-literal=MINIMAX_API_KEY="${MINIMAX_API_KEY:-}" \
   --from-literal=MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic/v1 \
   --from-literal=MINIMAX_MODELS=MiniMax-M2.7-highspeed \
-  --from-literal=PERSISTENCE_DEV_TOKEN=openmaic-school-dev \
-  --from-literal=PERSISTENCE_ALLOW_INSECURE_DEV_AUTH=true \
   --from-literal=ACCESS_CODE= \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n open-maic rollout restart deployment/openmaic

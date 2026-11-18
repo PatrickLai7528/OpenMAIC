@@ -10,8 +10,9 @@ data:
   HOSTNAME: "0.0.0.0"
   PORT: "3000"
   NODE_ENV: "production"
-  # MetalLB / plain HTTP: browsers drop Secure cookies on http://, causing session 404s
-  ANONYMOUS_COOKIE_SECURE: "0"
+  # MetalLB / plain HTTP: 上游 lib/server/cookie-secure.ts 只在 COOKIE_SECURE=0
+  # 時關掉 Secure；任何其他寫法（false/no）都不生效。
+  COOKIE_SECURE: "0"
 
   OPENMAIC_AGENT_RUNTIME_ENABLED: "true"
   # Per-pod concurrent agent runs; 2 replicas × 4 ≈ 8 simultaneous long runs

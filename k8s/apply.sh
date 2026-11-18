@@ -19,7 +19,6 @@
 #                           for PRO/agent runtime; without it generate_tts reports
 #                           "no enabled server TTS capability" and pages stay silent)
 #   TTS_MINIMAX_BASE_URL      default = https://api.minimaxi.com
-#   PERSISTENCE_DEV_TOKEN     default = openmaic-school-dev
 #   ACCESS_CODE               default empty
 #   NAMESPACE                 default = open-maic
 #   APPLY_INGRESS             default = 1 (set 0 to skip Ingress)
@@ -76,8 +75,6 @@ MINIMAX_BASE_URL="${MINIMAX_BASE_URL:-https://api.minimaxi.com/anthropic/v1}"
 MINIMAX_MODELS="${MINIMAX_MODELS:-MiniMax-M2.7-highspeed}"
 TTS_MINIMAX_API_KEY="${TTS_MINIMAX_API_KEY:-$MINIMAX_API_KEY}"
 TTS_MINIMAX_BASE_URL="${TTS_MINIMAX_BASE_URL:-https://api.minimaxi.com}"
-PERSISTENCE_DEV_TOKEN="${PERSISTENCE_DEV_TOKEN:-openmaic-school-dev}"
-PERSISTENCE_ALLOW_INSECURE_DEV_AUTH="${PERSISTENCE_ALLOW_INSECURE_DEV_AUTH:-true}"
 ACCESS_CODE="${ACCESS_CODE:-}"
 
 kapply() {
@@ -117,8 +114,6 @@ kubectl -n "${NAMESPACE}" create secret generic openmaic-secrets \
   --from-literal=OPENAI_MODELS="${OPENAI_MODELS}" \
   --from-literal=TTS_MINIMAX_API_KEY="${TTS_MINIMAX_API_KEY}" \
   --from-literal=TTS_MINIMAX_BASE_URL="${TTS_MINIMAX_BASE_URL}" \
-  --from-literal=PERSISTENCE_DEV_TOKEN="${PERSISTENCE_DEV_TOKEN}" \
-  --from-literal=PERSISTENCE_ALLOW_INSECURE_DEV_AUTH="${PERSISTENCE_ALLOW_INSECURE_DEV_AUTH}" \
   --from-literal=ACCESS_CODE="${ACCESS_CODE}" \
   --dry-run=client -o yaml | kapply -f -
 

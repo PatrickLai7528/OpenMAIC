@@ -16,10 +16,6 @@ concurrency:
   group: docker-ghcr-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Must stay in sync with k8s/apply.sh defaults for PERSISTENCE_DEV_TOKEN
-  PERSISTENCE_TOKEN: openmaic-school-dev
-
 jobs:
   build-and-push:
     name: Build and push
@@ -68,11 +64,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
+            NEXT_PUBLIC_WORKBENCH_ENABLED=true
             NEXT_PUBLIC_PRO_WORKBENCH_ENABLED=true
             NEXT_PUBLIC_MAIC_EDITOR_ENABLED=true
             NEXT_PUBLIC_MAIC_EDITOR_RENDERER_ENABLED=true
-            NEXT_PUBLIC_PERSISTENCE=1
-            NEXT_PUBLIC_PERSISTENCE_TOKEN=${{ env.PERSISTENCE_TOKEN }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

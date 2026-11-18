@@ -93,7 +93,7 @@ GHCR_TOKEN=ghp_你的PAT_需read_packages
 | `GHCR_TOKEN` | ✅ | PAT（至少 `read:packages`） |
 | `APPLY_INGRESS` | 可選 | 預設 `1`；設 `0` 可先不建 Ingress |
 
-ConfigMap `openmaic-config` 另含 `ANONYMOUS_COOKIE_SECURE=0`：校內 MetalLB 走 **HTTP** 時必須關閉，否則瀏覽器不存 `anonymous_id`，`/api/agent/sessions/:id` 會一直 404。HTTPS 終止後再改成 `1`。
+ConfigMap `openmaic-config` 另含 `COOKIE_SECURE=0`：上游（`lib/server/cookie-secure.ts`）在 production 預設對所有自家 cookie 加 `Secure`，校內 MetalLB 走 **HTTP** 時瀏覽器不存 `anonymous_id`，session API 會一直 404，故必須設**精確值 `0`**（寫 `false` / `no` 無效）。HTTPS 終止後移除該行即可。
 
 ---
 
