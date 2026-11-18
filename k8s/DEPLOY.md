@@ -1,6 +1,6 @@
 # OpenMAIC → Kubernetes 佈署指南
 
-Namespace：**`ky-super-openamic`**  
+Namespace：**`open-maic`**  
 開發分支（會觸發建 image）：**`feat/patricklai7528-dev`**  
 映像倉庫：**GHCR** `ghcr.io/<owner>/<repo>`（小寫）
 
@@ -21,7 +21,7 @@ GitHub Actions (docker-ghcr.yml)
 ghcr.io/<owner>/<repo>:agent-runtime | :latest | :sha-xxxx
         │
         ▼
-kubectl / ./apply.sh  →  ky-super-openamic
+kubectl / ./apply.sh  →  open-maic
         │
         ▼
 Pods 連外掛 Postgres（DATABASE_URL）
@@ -33,7 +33,7 @@ Pods 連外掛 Postgres（DATABASE_URL）
 
 | 項目 | 說明 |
 |------|------|
-| `kubectl` | 已連上校內集群，可操作 `ky-super-openamic` |
+| `kubectl` | 已連上校內集群，可操作 `open-maic` |
 | Postgres | 集群 Pod 能直連（支援 `LISTEN`/`NOTIFY`，勿用 transaction pooler） |
 | GHCR 映像 | 已 push `feat/patricklai7528-dev` 並等 Actions 成功 |
 | MiniMax Key | 有可用 API Key |
@@ -71,10 +71,12 @@ cp deploy.env.example deploy.env
 編輯 `deploy.env`（此檔被 `k8s/.gitignore` 忽略）：
 
 ```bash
-NAMESPACE=ky-super-openamic
+NAMESPACE=open-maic
 
 DATABASE_URL=postgres://USER:PASSWORD@PG_HOST:5432/DB_NAME
-MINIMAX_API_KEY=sk-你的真實key
+OPENAI_API_KEY=ark-你的火山方舟key
+OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+OPENAI_MODELS=doubao-seed-2-1-pro-260628
 IMAGE=ghcr.io/<owner>/<repo>:agent-runtime
 
 # Private GHCR — apply.sh 會建立 secret/registry-cred
@@ -85,11 +87,13 @@ GHCR_TOKEN=ghp_你的PAT_需read_packages
 | 變數 | 必填 | 說明 |
 |------|------|------|
 | `DATABASE_URL` | ✅ | Postgres 連線字串 |
-| `MINIMAX_API_KEY` | ✅ | MiniMax API Key（`OPENAI_API_KEY` 預設跟它相同） |
+| `OPENAI_API_KEY` | ✅ | 火山方舟 API Key。`OPENAI_BASE_URL` 預設 `https://ark.cn-beijing.volces.com/api/v3`，模型預設 `doubao-seed-2-1-pro-260628` |
 | `IMAGE` | ✅ | GHCR 映像 tag（建議用 `sha-…` 鎖定版本） |
 | `GHCR_USERNAME` | ✅ | GitHub 用戶名 |
 | `GHCR_TOKEN` | ✅ | PAT（至少 `read:packages`） |
 | `APPLY_INGRESS` | 可選 | 預設 `1`；設 `0` 可先不建 Ingress |
+
+ConfigMap `openmaic-config` 另含 `ANONYMOUS_COOKIE_SECURE=0`：校內 MetalLB 走 **HTTP** 時必須關閉，否則瀏覽器不存 `anonymous_id`，`/api/agent/sessions/:id` 會一直 404。HTTPS 終止後再改成 `1`。
 
 ---
 
@@ -104,7 +108,7 @@ chmod +x ./apply.sh
 
 `apply.sh` 會：
 
-1. 建立／更新 Namespace `ky-super-openamic`
+1. 建立／更新 Namespace `open-maic`
 2. 建立／更新 `registry-cred`（GHCR pull）與 `openmaic-secrets`
 3. Apply ConfigMap / Deployment / Service（及 Ingress，除非 `APPLY_INGRESS=0`）
 4. `kubectl set image` 設成你的 `IMAGE`
@@ -114,7 +118,7 @@ chmod +x ./apply.sh
 
 ```bash
 DATABASE_URL='postgres://USER:PASS@HOST:5432/DB' \
-MINIMAX_API_KEY='sk-...' \
+OPENAI_API_KEY='ark-...' \
 IMAGE='ghcr.io/owner/repo:sha-abc1234' \
 GHCR_USERNAME='you' \
 GHCR_TOKEN='ghp_...' \
@@ -126,17 +130,23 @@ GHCR_TOKEN='ghp_...' \
 ## 4. 驗證
 
 ```bash
-kubectl -n ky-super-openamic get pods,svc,ingress
-kubectl -n ky-super-openamic logs -l app.kubernetes.io/name=openmaic --tail=80
+kubectl -n open-maic get pods,svc,ingress
+kubectl -n open-maic logs -l app.kubernetes.io/name=openmaic --tail=80
 # 應看到：[AgentRunner] runner ... started
 ```
 
-本機預覽（無 Ingress 時）：
+### 區網訪問（LoadBalancer）
+
+`openmaic` Service 為 **LoadBalancer**（MetalLB）。取得 IP：
 
 ```bash
-kubectl -n ky-super-openamic port-forward svc/openmaic 3001:80
-# 瀏覽器 http://localhost:3001
+kubectl -n open-maic get svc openmaic
+# EXTERNAL-IP 例如 YOUR_LB_IP
 ```
+
+同一 LAN 內瀏覽器打開：`http://<EXTERNAL-IP>/`（埠 80）。
+
+本機 port-forward 僅供臨時除錯，正式使用請用上述區網 IP。
 
 ---
 
@@ -146,8 +156,8 @@ kubectl -n ky-super-openamic port-forward svc/openmaic 3001:80
 
 ```bash
 export IMAGE='ghcr.io/owner/repo:sha-新的'
-kubectl -n ky-super-openamic set image deployment/openmaic "openmaic=${IMAGE}"
-kubectl -n ky-super-openamic rollout status deployment/openmaic
+kubectl -n open-maic set image deployment/openmaic "openmaic=${IMAGE}"
+kubectl -n open-maic rollout status deployment/openmaic
 ```
 
 **改 DB／API Key：** 改 `deploy.env` 後再跑一次 `./apply.sh`（會更新 Secret 並 rollout）。

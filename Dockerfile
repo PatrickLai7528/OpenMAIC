@@ -131,6 +131,11 @@ COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
+# Server-side media (TTS audio, generated images) writes to
+# process.cwd()/data — pre-create it writable so deployments without a
+# mounted volume don't hit EACCES (k8s mounts a PVC over this path).
+RUN mkdir -p /app/data && chown nextjs:nodejs /app/data
+
 USER nextjs
 
 EXPOSE 3000

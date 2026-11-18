@@ -1,0 +1,20 @@
+# Shared writable data dir for classroom media (TTS audio, generated images).
+# The app writes to process.cwd()/data (= /app/data in the image), but /app is
+# root-owned while the server runs as uid 1001 — without this volume every
+# server-side media write fails with EACCES (silent TTS "failed" counts,
+# UsageStorage warnings). Longhorn RWX so both replicas share the same files:
+# media persisted by pod A must be servable by pod B via /api/classroom-media.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: openmaic-data
+  namespace: open-maic
+  labels:
+    app.kubernetes.io/name: openmaic
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 10Gi

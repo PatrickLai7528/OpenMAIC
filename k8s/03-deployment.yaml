@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: openmaic
-  namespace: ky-super-openamic
+  namespace: open-maic
   labels:
     app.kubernetes.io/name: openmaic
 spec:
@@ -20,6 +20,10 @@ spec:
       labels:
         app.kubernetes.io/name: openmaic
     spec:
+      # nextjs runs as uid 1001 / gid 65533 (nogroup); fsGroup makes the
+      # mounted data volume group-writable so the server can create /app/data.
+      securityContext:
+        fsGroup: 65533
       imagePullSecrets:
         - name: registry-cred
       containers:
@@ -27,6 +31,9 @@ spec:
           # Placeholder; overridden at apply time by apply.sh (IMAGE=...).
           image: openmaic:agent-runtime
           imagePullPolicy: IfNotPresent
+          # anonymous_id cookie Secure 屬性由 ANONYMOUS_COOKIE_SECURE=0
+          # （見 configmap）在應用層關閉；不再需要開機改寫 .next/server 的補丁。
+          # ⚠️ 依賴含 owner.ts cookie 修正的映像（此 YAML 隨該修正一同提交後的 build）。
           ports:
             - name: http
               containerPort: 3000
@@ -35,6 +42,9 @@ spec:
                 name: openmaic-config
             - secretRef:
                 name: openmaic-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
           resources:
             requests:
               cpu: "1"
@@ -60,3 +70,7 @@ spec:
             failureThreshold: 3
       # Ensure pods can reach the Postgres host in DATABASE_URL (cluster egress / firewall).
       restartPolicy: Always
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: openmaic-data

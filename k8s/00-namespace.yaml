@@ -2,7 +2,7 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ky-super-openamic
+  name: open-maic
   labels:
     app.kubernetes.io/name: openmaic
-    app.kubernetes.io/part-of: ky-super-openamic
+    app.kubernetes.io/part-of: open-maic

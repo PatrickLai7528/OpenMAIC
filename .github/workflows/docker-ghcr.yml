@@ -90,6 +90,6 @@ jobs:
             echo ""
             echo '```bash'
             echo "IMAGE='${{ steps.image.outputs.name }}:sha-${SHORT_SHA}' \\"
-            echo "DATABASE_URL='...' MINIMAX_API_KEY='...' ./k8s/apply.sh"
+            echo "DATABASE_URL='...' OPENAI_API_KEY='...' ./k8s/apply.sh"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

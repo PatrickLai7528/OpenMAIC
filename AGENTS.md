@@ -46,7 +46,7 @@ done
 | 路徑 | 原因 |
 |------|------|
 | `.env` / `.env.local` / `.env.*.local` | 本機 API Key、連線字串 |
-| `k8s/deploy.env` | 真實 `DATABASE_URL` / `MINIMAX_API_KEY` / `IMAGE` |
+| `k8s/deploy.env` | 真實 `DATABASE_URL` / `OPENAI_API_KEY` / `IMAGE` |
 | 含真實密碼的 `**/secret*.yaml` | 應改由 `k8s/apply.sh` + ENV 注入 |
 | 憑證、私鑰、kubeconfig | 一律不進 Git |
 
@@ -74,7 +74,7 @@ done
 
 ## 佈署相關提醒
 
-- K8s：`DATABASE_URL`、`MINIMAX_API_KEY`、`IMAGE` 用環境變數或 `./k8s/apply.sh` 傳入，見 `k8s/README.md`。
+- K8s：`DATABASE_URL`、`OPENAI_API_KEY`、`IMAGE` 用環境變數或 `./k8s/apply.sh` 傳入，見 `k8s/README.md`。對話走火山方舟 OpenAI 相容介面。
 - Docker 本機說明若在 `Docs/`，可能被 `.gitignore` 的 `/docs` 規則忽略；勿把真實密鑰寫進可追蹤文件。
 
 ---
@@ -91,7 +91,7 @@ done
 
 ```bash
 IMAGE='ghcr.io/<owner>/<repo>:sha-xxxxxxxx' \
-DATABASE_URL='...' MINIMAX_API_KEY='...' \
+DATABASE_URL='...' OPENAI_API_KEY='...' \
 ./k8s/apply.sh
 ```
 

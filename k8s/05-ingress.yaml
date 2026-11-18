@@ -3,7 +3,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: openmaic
-  namespace: ky-super-openamic
+  namespace: open-maic
   labels:
     app.kubernetes.io/name: openmaic
   annotations:

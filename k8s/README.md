@@ -1,17 +1,18 @@
-# OpenMAIC — Kubernetes 佈署（namespace: `ky-super-openamic`）
+# OpenMAIC — Kubernetes 佈署（namespace: `open-maic`）
 
 密鑰與映像**不要**寫死在 Git YAML。用環境變數（或 `deploy.env`）在套用時傳入。
 
 | 變數 | 必填 | 說明 |
 |------|------|------|
 | `DATABASE_URL` | ✅ | 例：`postgres://open_maic:CHANGE_ME@YOUR_PG_HOST:5432/open_maic` |
-| `MINIMAX_API_KEY` | ✅ | MiniMax API Key |
+| `OPENAI_API_KEY` | ✅ | 火山方舟 API Key（`ark-...`），走 OpenAI 相容介面 |
+| `OPENAI_BASE_URL` | 可選 | 預設 `https://ark.cn-beijing.volces.com/api/v3` |
+| `OPENAI_MODELS` | 可選 | 預設 `doubao-seed-2-1-pro-260628` |
 | `IMAGE` | ✅ | 例：`ghcr.io/<owner>/<repo>:agent-runtime`（由 GitHub Actions `Docker GHCR` workflow 推送） |
 | `GHCR_USERNAME` | ✅ | GitHub 用戶名（拉 Private GHCR 映像） |
 | `GHCR_TOKEN` | ✅ | GitHub PAT，至少勾選 `read:packages` |
 | `GHCR_EMAIL` | 可選 | docker-registry secret 用，可空 |
-| `OPENAI_API_KEY` | 可選 | 預設等於 `MINIMAX_API_KEY`（OpenAI 相容端點） |
-| `OPENAI_BASE_URL` / `OPENAI_MODELS` | 可選 | 預設 MiniMax OpenAI 相容設定 |
+| `MINIMAX_API_KEY` | 可選 | 只給 MiniMax 旁白 TTS；對話不再預設用它 |
 | `APPLY_INGRESS` | 可選 | 預設 `1`；設 `0` 跳過 Ingress |
 
 Agent Runtime 需要 **直連** Postgres（`LISTEN`/`NOTIFY`），勿用 transaction-mode pooler。
@@ -33,7 +34,7 @@ chmod +x ./apply.sh
 
 ```bash
 DATABASE_URL='postgres://open_maic:CHANGE_ME@YOUR_PG_HOST:5432/open_maic' \
-MINIMAX_API_KEY='sk-...' \
+OPENAI_API_KEY='ark-...' \
 IMAGE='ghcr.io/YOUR_USER/openmaic:agent-runtime' \
 GHCR_USERNAME='YOUR_GITHUB_USERNAME' \
 GHCR_TOKEN='ghp_...' \
@@ -51,9 +52,9 @@ GHCR_TOKEN='ghp_...' \
 ## 只用 kubectl（等價手動）
 
 ```bash
-export NAMESPACE=ky-super-openamic
+export NAMESPACE=open-maic
 export DATABASE_URL='postgres://open_maic:CHANGE_ME@YOUR_PG_HOST:5432/open_maic'
-export MINIMAX_API_KEY='sk-...'
+export OPENAI_API_KEY='ark-...'
 export IMAGE='ghcr.io/YOUR_USER/openmaic:agent-runtime'
 export GHCR_USERNAME='YOUR_GITHUB_USERNAME'
 export GHCR_TOKEN='ghp_...'
@@ -69,10 +70,10 @@ kubectl -n "$NAMESPACE" create secret docker-registry registry-cred \
 
 kubectl -n "$NAMESPACE" create secret generic openmaic-secrets \
   --from-literal=DATABASE_URL="$DATABASE_URL" \
-  --from-literal=MINIMAX_API_KEY="$MINIMAX_API_KEY" \
-  --from-literal=OPENAI_API_KEY="${OPENAI_API_KEY:-$MINIMAX_API_KEY}" \
-  --from-literal=OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.minimaxi.com/v1}" \
-  --from-literal=OPENAI_MODELS="${OPENAI_MODELS:-MiniMax-M2.7-highspeed}" \
+  --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+  --from-literal=OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://ark.cn-beijing.volces.com/api/v3}" \
+  --from-literal=OPENAI_MODELS="${OPENAI_MODELS:-doubao-seed-2-1-pro-260628}" \
+  --from-literal=MINIMAX_API_KEY="${MINIMAX_API_KEY:-}" \
   --from-literal=MINIMAX_BASE_URL="${MINIMAX_BASE_URL:-https://api.minimaxi.com/anthropic/v1}" \
   --from-literal=MINIMAX_MODELS="${MINIMAX_MODELS:-MiniMax-M2.7-highspeed}" \
   --from-literal=PERSISTENCE_DEV_TOKEN="${PERSISTENCE_DEV_TOKEN:-openmaic-school-dev}" \
@@ -88,22 +89,22 @@ kubectl -n "$NAMESPACE" set image deployment/openmaic "openmaic=${IMAGE}"
 
 ```bash
 # 換 image
-kubectl -n ky-super-openamic set image deployment/openmaic openmaic="$IMAGE"
+kubectl -n open-maic set image deployment/openmaic openmaic="$IMAGE"
 
 # 更新 Secret 後重啟 Pod
-kubectl -n ky-super-openamic create secret generic openmaic-secrets \
+kubectl -n open-maic create secret generic openmaic-secrets \
   --from-literal=DATABASE_URL="$DATABASE_URL" \
-  --from-literal=MINIMAX_API_KEY="$MINIMAX_API_KEY" \
-  --from-literal=OPENAI_API_KEY="${OPENAI_API_KEY:-$MINIMAX_API_KEY}" \
-  --from-literal=OPENAI_BASE_URL=https://api.minimaxi.com/v1 \
-  --from-literal=OPENAI_MODELS=MiniMax-M2.7-highspeed \
+  --from-literal=OPENAI_API_KEY="$OPENAI_API_KEY" \
+  --from-literal=OPENAI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3 \
+  --from-literal=OPENAI_MODELS=doubao-seed-2-1-pro-260628 \
+  --from-literal=MINIMAX_API_KEY="${MINIMAX_API_KEY:-}" \
   --from-literal=MINIMAX_BASE_URL=https://api.minimaxi.com/anthropic/v1 \
   --from-literal=MINIMAX_MODELS=MiniMax-M2.7-highspeed \
   --from-literal=PERSISTENCE_DEV_TOKEN=openmaic-school-dev \
   --from-literal=PERSISTENCE_ALLOW_INSECURE_DEV_AUTH=true \
   --from-literal=ACCESS_CODE= \
   --dry-run=client -o yaml | kubectl apply -f -
-kubectl -n ky-super-openamic rollout restart deployment/openmaic
+kubectl -n open-maic rollout restart deployment/openmaic
 ```
 
 ---
@@ -119,9 +120,9 @@ kubectl -n ky-super-openamic rollout restart deployment/openmaic
 ## 驗證
 
 ```bash
-kubectl -n ky-super-openamic get pods,svc,ingress
-kubectl -n ky-super-openamic logs -l app.kubernetes.io/name=openmaic --tail=80
-kubectl -n ky-super-openamic port-forward svc/openmaic 3001:80
+kubectl -n open-maic get pods,svc,ingress
+kubectl -n open-maic logs -l app.kubernetes.io/name=openmaic --tail=80
+kubectl -n open-maic port-forward svc/openmaic 3001:80
 ```
 
 ---
