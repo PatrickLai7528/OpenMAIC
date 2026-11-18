@@ -19,8 +19,31 @@ function readCookie(headers: Headers, name: string): string | undefined {
   return undefined;
 }
 
-function anonymousCookieHeader(id: string): string {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+/**
+ * Whether the anonymous owner cookie should carry the Secure attribute.
+ *
+ * Production defaults to Secure so HTTPS deployments do not leak the cookie
+ * over cleartext. Plain-HTTP LAN / MetalLB setups must opt out: browsers and
+ * many HTTP clients refuse to store or send Secure cookies on `http://`, which
+ * mints a new owner on every request and makes session GETs look like 404s.
+ *
+ * Override with ANONYMOUS_COOKIE_SECURE=0|false (force off) or 1|true (force on).
+ * When unset, Secure is also skipped if X-Forwarded-Proto is explicitly http.
+ */
+function shouldSetSecureAnonymousCookie(req: Pick<Request, 'headers'>): boolean {
+  const override = process.env.ANONYMOUS_COOKIE_SECURE?.trim().toLowerCase();
+  if (override === '0' || override === 'false' || override === 'off') return false;
+  if (override === '1' || override === 'true' || override === 'on') return true;
+
+  const proto = req.headers.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+  if (proto === 'http') return false;
+  if (proto === 'https') return true;
+
+  return process.env.NODE_ENV === 'production';
+}
+
+function anonymousCookieHeader(id: string, req: Pick<Request, 'headers'>): string {
+  const secure = shouldSetSecureAnonymousCookie(req) ? '; Secure' : '';
   return (
     `${ANONYMOUS_COOKIE}=${id}; Path=/; HttpOnly; SameSite=Lax; ` +
     `Max-Age=${ANONYMOUS_COOKIE_MAX_AGE_SECONDS}${secure}`
@@ -60,6 +83,6 @@ export function resolveRequestOwnerId(
   if (existingId && UUID_V4.test(existingId)) return `anon:${existingId}`;
 
   const id = randomUUID();
-  responseHeaders.append('Set-Cookie', anonymousCookieHeader(id));
+  responseHeaders.append('Set-Cookie', anonymousCookieHeader(id, req));
   return `anon:${id}`;
 }

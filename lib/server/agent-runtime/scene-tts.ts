@@ -11,6 +11,9 @@ import {
   resolveTTSModel,
 } from '@/lib/server/provider-config';
 import { persistClassroomMediaBytes } from '@/lib/server/classroom-media-bytes';
+import { createLogger } from '@/lib/logger';
+
+const log = createLogger('scene-tts');
 
 export interface SceneTtsSummary {
   available: boolean;
@@ -18,6 +21,10 @@ export interface SceneTtsSummary {
   generated: number;
   skipped: number;
   failed: string[];
+  /** Per-action failure reasons, aligned with `failed`. Surfaced in the tool
+   * result so a misconfigured deployment (permissions, provider errors) is
+   * debuggable from the agent transcript instead of a bare failure count. */
+  failures: Array<{ actionId: string; error: string }>;
 }
 
 export interface SceneTtsInput {
@@ -51,12 +58,12 @@ export async function synthesizeSceneNarration(input: SceneTtsInput): Promise<Sc
       : enabled[0]
   ) as TTSProviderId | undefined;
   if (!providerId) {
-    return { available: false, changed: false, generated: 0, skipped: 0, failed: [] };
+    return { available: false, changed: false, generated: 0, skipped: 0, failed: [], failures: [] };
   }
   const provider = TTS_PROVIDERS[providerId as keyof typeof TTS_PROVIDERS];
   const apiKey = resolveTTSApiKey(providerId);
   if (provider?.requiresApiKey && !apiKey) {
-    return { available: false, changed: false, generated: 0, skipped: 0, failed: [] };
+    return { available: false, changed: false, generated: 0, skipped: 0, failed: [], failures: [] };
   }
   const voice =
     bound?.providerId === providerId && bound.voiceId
@@ -71,6 +78,7 @@ export async function synthesizeSceneNarration(input: SceneTtsInput): Promise<Sc
   let generated = 0;
   let skipped = 0;
   const failed: string[] = [];
+  const failures: Array<{ actionId: string; error: string }> = [];
   for (const action of input.scene.actions ?? []) {
     if (action.type !== 'speech' || !(action as SpeechAction).text) continue;
     const speech = action as SpeechAction;
@@ -118,6 +126,9 @@ export async function synthesizeSceneNarration(input: SceneTtsInput): Promise<Sc
       // actions would hit the same hung upstream and the session would wedge.
       if (error instanceof TTSRequestTimeoutError) throw error;
       failed.push(action.id);
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push({ actionId: action.id, error: message });
+      log.warn(`TTS failed for action ${action.id} (provider=${providerId}): ${message}`);
     }
   }
   return {
@@ -126,5 +137,6 @@ export async function synthesizeSceneNarration(input: SceneTtsInput): Promise<Sc
     generated,
     skipped,
     failed,
+    failures,
   };
 }

@@ -93,6 +93,7 @@ function deps(store: CourseStore, extra: Record<string, unknown> = {}) {
       generated: 0,
       skipped: 0,
       failed: [],
+      failures: [],
     })),
     ...extra,
   };

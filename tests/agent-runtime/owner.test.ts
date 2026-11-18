@@ -42,13 +42,35 @@ describe('resolveRequestOwnerId', () => {
     );
   });
 
-  it('adds Secure to the cookie in production', () => {
+  it('adds Secure to the cookie in production over HTTPS', () => {
     vi.stubEnv('NODE_ENV', 'production');
     const responseHeaders = new Headers();
 
     resolveRequestOwnerId(new Request('https://example.test/agent'), responseHeaders);
 
     expect(responseHeaders.get('set-cookie')).toMatch(/; Secure$/);
+  });
+
+  it('skips Secure in production when X-Forwarded-Proto is http', () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    const responseHeaders = new Headers();
+    const request = new Request('http://10.0.0.1/agent', {
+      headers: { 'x-forwarded-proto': 'http' },
+    });
+
+    resolveRequestOwnerId(request, responseHeaders);
+
+    expect(responseHeaders.get('set-cookie')).not.toMatch(/; Secure/i);
+  });
+
+  it('honors ANONYMOUS_COOKIE_SECURE=0 even in production', () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('ANONYMOUS_COOKIE_SECURE', '0');
+    const responseHeaders = new Headers();
+
+    resolveRequestOwnerId(new Request('https://example.test/agent'), responseHeaders);
+
+    expect(responseHeaders.get('set-cookie')).not.toMatch(/; Secure/i);
   });
 
   it('uses an explicit authenticated owner without minting an anonymous cookie', () => {

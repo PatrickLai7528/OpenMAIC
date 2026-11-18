@@ -135,8 +135,10 @@ export function buildCourseAudioAndDeckTools(deps: CourseToolDeps): AgentTool<ne
           detail: `narration audio persisted for ${scene.id}`,
         });
       }
+      const firstFailure = summary.failures[0];
       return result(
-        `Narration audio: ${summary.generated} generated, ${summary.skipped} skipped, ${summary.failed.length} failed.`,
+        `Narration audio: ${summary.generated} generated, ${summary.skipped} skipped, ${summary.failed.length} failed.` +
+          (firstFailure ? ` First failure: ${firstFailure.error}` : ''),
         {
           sceneId: scene.id,
           ...summary,
